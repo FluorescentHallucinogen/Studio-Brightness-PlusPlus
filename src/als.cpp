@@ -180,7 +180,7 @@ static std::mutex             g_alsSnapMtx;
 // A HID sensor powers up in "No Events" and streams nothing until a host writes its
 // Reporting State feature (usage 0x0316) = All Events (2). The Windows sensor mapper does
 // this automatically; when we read the raw HID interface ourselves we must do it too, or
-// every input read times out and no lux is ever produced. Same issue/fix as the WinUSB path.
+// every input read times out and no lux is ever produced.
 static bool alsFeatureReportId(PHIDP_PREPARSED_DATA prep, USAGE usage, UCHAR *rid) {
 	HIDP_CAPS caps{};
 	if (HidP_GetCaps(prep, &caps) != HIDP_STATUS_SUCCESS || caps.NumberFeatureValueCaps == 0) return false;
