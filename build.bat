@@ -64,16 +64,22 @@ if errorlevel 1 exit /b 1
 cl %CXXFLAGS% -c -Foobj/orientation.obj src/orientation.cpp
 if errorlevel 1 exit /b 1
 
+cl %CXXFLAGS% -c -Foobj/als.obj src/als.cpp
+if errorlevel 1 exit /b 1
+
+cl %CXXFLAGS% -c -Foobj/winusb_als.obj src/winusb_als.cpp
+if errorlevel 1 exit /b 1
+
 :: Compile resources
 rc -Iinclude -foobj/studio-brightness-plusplus.res studio-brightness-plusplus.rc
 if errorlevel 1 exit /b 1
 
 :: Link everything
-cl -Fe./bin/studio-brightness-plusplus.exe obj/main.obj obj/hid.obj obj/Settings.obj obj/OSDWindow.obj obj/TrayPopup.obj obj/Log.obj obj/LogWindow.obj obj/Updater.obj obj/HdrMonitor.obj obj/PresetConfirm.obj obj/NvHdr.obj obj/orientation.obj obj/studio-brightness-plusplus.res ^
+cl -Fe./bin/studio-brightness-plusplus.exe obj/main.obj obj/hid.obj obj/Settings.obj obj/OSDWindow.obj obj/TrayPopup.obj obj/Log.obj obj/LogWindow.obj obj/Updater.obj obj/HdrMonitor.obj obj/PresetConfirm.obj obj/NvHdr.obj obj/orientation.obj obj/als.obj obj/winusb_als.obj obj/studio-brightness-plusplus.res ^
     -link /MANIFEST:EMBED /MANIFESTINPUT:studio-brightness-plusplus.manifest ^
     hid.lib setupapi.lib shlwapi.lib wbemuuid.lib comctl32.lib User32.lib Shell32.lib Gdi32.lib ^
     sensorsapi.lib ole32.lib Advapi32.lib gdiplus.lib PortableDeviceGuids.lib ^
-    winhttp.lib runtimeobject.lib oleaut32.lib dxgi.lib
+    winhttp.lib runtimeobject.lib oleaut32.lib dxgi.lib winusb.lib
 if errorlevel 1 exit /b 1
 
 echo Build successful.

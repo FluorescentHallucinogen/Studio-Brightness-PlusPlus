@@ -36,6 +36,8 @@
 #include "NvHdr.h"
 #include "PresetConfirm.h"
 #include "orientation.h"
+#include "als.h"
+#include "winusb_als.h"
 
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "sensorsapi.lib")
@@ -469,6 +471,25 @@ static void cleanupAlsSensors() {
 static float getAmbientLux(const DisplayDevice &dev) {
 	std::lock_guard<std::mutex> lock(g_alsMutex);
 
+	// WinUSB ALS (Studio Display XDR MI_08) — highest priority when present for this display.
+	{
+		float lx;
+		if (winusb_als_get_lux(&dev.containerId, &lx)) {
+			g_lastKnownLux.store(lx, std::memory_order_relaxed);
+			return lx;
+		}
+	}
+
+	// Prefer the raw-HID Apple ALS (the same source Boot Camp uses) matched to this display.
+	{
+		GUID zeroG = {};
+		float lx;
+		if (memcmp(&dev.containerId, &zeroG, sizeof(GUID)) != 0 && als_get_lux(&dev.containerId, &lx)) {
+			g_lastKnownLux.store(lx, std::memory_order_relaxed);
+			return lx;
+		}
+	}
+
 	// Try to find a sensor matching this display's ContainerId
 	GUID zero = {};
 	if (memcmp(&dev.containerId, &zero, sizeof(GUID)) != 0) {
@@ -478,6 +499,15 @@ static float getAmbientLux(const DisplayDevice &dev) {
 				g_lastKnownLux.store(lx, std::memory_order_relaxed);
 				return lx;
 			}
+		}
+	}
+
+	// Raw-HID master (any display's ALS) before the Sensor-API master.
+	{
+		float lx;
+		if (als_get_lux(nullptr, &lx)) {
+			g_lastKnownLux.store(lx, std::memory_order_relaxed);
+			return lx;
 		}
 	}
 
@@ -920,6 +950,8 @@ LRESULT CALLBACK HiddenWndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
 	}
 	if (m == WM_TIMER && wParam == ID_ORIENT_TIMER) {
 		orient_watch_tick();
+		als_watch_tick();
+		winusb_als_tick();
 		return 0;
 	}
 	if (m == WMAPP_NOTIFYCALLBACK) {
@@ -1313,7 +1345,9 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 	SetTimer(h, ID_HDR_TIMER, 2000, nullptr);   // poll HDR; also refreshed on WM_DISPLAYCHANGE
 	orient_watch_init();                        // discover Apple orientation sensors (MI_09)
 	orient_set_enabled(g_settings.autoRotateEnabled.load());
-	SetTimer(h, ID_ORIENT_TIMER, 250, nullptr); // poll orientation -> autorotate
+	als_watch_init();                           // discover Apple raw-HID ALS (MI_08 illuminance)
+	winusb_als_init();                          // XDR ALS over WinUSB (MI_08 vendor interface)
+	SetTimer(h, ID_ORIENT_TIMER, 250, nullptr); // poll orientation + ALS on this timer
 	RefreshHdrState();
 	NvapiLogHdrState(L"startup");
 	StartUpdateCheck(false);
@@ -1325,6 +1359,8 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 	}
 
 	orient_watch_shutdown();
+	als_watch_shutdown();
+	winusb_als_shutdown();
 	GdiplusShutdown(gdiplusToken);
 	CoUninitialize();
 	CloseHandle(hSingleInstance);
