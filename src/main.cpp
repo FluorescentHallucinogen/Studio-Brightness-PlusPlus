@@ -60,7 +60,6 @@ constexpr wchar_t kAppVersion[] = SBPP_VERSION_STR;
 constexpr UINT     WMAPP_UPDATE_READY = WM_APP + 2;
 constexpr UINT_PTR ID_UPDATE_TIMER    = 0xA001;
 constexpr UINT_PTR ID_HDR_TIMER       = 0xA002;
-constexpr UINT_PTR ID_ORIENT_TIMER    = 0xA003;
 static std::atomic<bool> g_updateAvailable{false};
 static std::atomic<bool> g_updateChecking{false};
 static std::mutex        g_updateMutex;
@@ -537,7 +536,7 @@ static void SetBrightness(DisplayDevice &dev, ULONG val, bool isUserAction, bool
 		if (isUserAction) {
 			dev.baseBrightness = safeVal;
 			if (safeVal != dev.minBrightness && safeVal != dev.maxBrightness)
-				dev.baseLux = getAmbientLux(dev);
+				dev.baseLux = std::max(1.f, getAmbientLux(dev));
 			// Stop any auto ramp and drop the hysteresis anchor so auto re-syncs to the user.
 			dev.rampDurationMs = 0.0;
 			dev.lastTargetLux  = 0.f;
@@ -938,11 +937,6 @@ LRESULT CALLBACK HiddenWndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
 		RefreshHdrState();
 		return 0;
 	}
-	if (m == WM_TIMER && wParam == ID_ORIENT_TIMER) {
-		orient_watch_tick();
-		als_watch_tick();
-		return 0;
-	}
 	if (m == WMAPP_NOTIFYCALLBACK) {
 		if (LOWORD(lParam) == WM_LBUTTONUP) {
 			if (g_hdrActive.load()) {
@@ -1111,6 +1105,36 @@ bool RegisterHiddenClass() {
 	return true;
 }
 
+/* ---------- sensor polling thread ---------- */
+// Both watchers read with synchronous HID I/O: HidD_GetInputReport blocks, and the fallback
+// waits up to 150 ms per device. On a WM_TIMER that stalls the message pump several times a
+// second, and a panel waking from sleep can block a HID call for seconds. Polling goes here
+// instead and publishes into the snapshots the UI and the worker read.
+// Joined at shutdown, unlike the worker: the watchers free the handles it is still reading.
+static std::thread g_sensorThread;
+static HANDLE      g_sensorStop = nullptr;
+
+static void startSensorThread() {
+	g_sensorStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	if (!g_sensorStop) {
+		Log::Warn(L"Sensor thread not started: CreateEvent failed (%lu)", GetLastError());
+		return;
+	}
+	g_sensorThread = std::thread([] {
+		// Wait, not sleep, so shutdown does not cost a whole poll interval.
+		while (WaitForSingleObject(g_sensorStop, 250) == WAIT_TIMEOUT) {
+			orient_watch_tick();
+			als_watch_tick();
+		}
+	});
+}
+
+static void stopSensorThread() {
+	if (g_sensorStop) SetEvent(g_sensorStop);
+	if (g_sensorThread.joinable()) g_sensorThread.join();
+	if (g_sensorStop) { CloseHandle(g_sensorStop); g_sensorStop = nullptr; }
+}
+
 /* ---------- background worker thread ---------- */
 void startWorker() {
 	std::thread([] {
@@ -1179,7 +1203,9 @@ void startWorker() {
 						newDev.getBrightnessRange(&newDev.minBrightness, &newDev.maxBrightness);
 						if (newDev.getBrightness(&newDev.currentBrightness) == 0) {
 							newDev.baseBrightness = newDev.currentBrightness;
-							newDev.baseLux = getAmbientLux(newDev);
+							// mapLuxToBrightness divides by baseLux, and a sensor reads 0 in a dark room.
+							// Unclamped that sends the target to infinity.
+							newDev.baseLux = std::max(1.f, getAmbientLux(newDev));
 						}
 						Log::Info(L"Device %s ready [range %lu-%lu, current %lu]",
 						          newDev.name.c_str(), newDev.minBrightness, newDev.maxBrightness,
@@ -1327,15 +1353,18 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 		            L"Studio Brightness ++", MB_ICONWARNING);
 	}
 	registerHotkeys(h);
+
+	// Before startWorker: the worker anchors baseLux from the first reading it can get, so the
+	// raw-HID ALS has to be up and carrying a real sample by then.
+	orient_watch_init();                        // discover Apple orientation sensors (MI_09)
+	orient_set_enabled(g_settings.autoRotateEnabled.load());
+	als_watch_init();                           // discover Apple raw-HID ALS (MI_08 illuminance)
+	startSensorThread();                        // poll both off the UI thread
 	startWorker();
 
 	// Check for updates shortly after launch, then once a day.
 	SetTimer(h, ID_UPDATE_TIMER, 24 * 60 * 60 * 1000, nullptr);
 	SetTimer(h, ID_HDR_TIMER, 2000, nullptr);   // poll HDR; also refreshed on WM_DISPLAYCHANGE
-	orient_watch_init();                        // discover Apple orientation sensors (MI_09)
-	orient_set_enabled(g_settings.autoRotateEnabled.load());
-	als_watch_init();                           // discover Apple raw-HID ALS (MI_08 illuminance)
-	SetTimer(h, ID_ORIENT_TIMER, 250, nullptr); // poll orientation + ALS on this timer
 	RefreshHdrState();
 	NvapiLogHdrState(L"startup");
 	StartUpdateCheck(false);
@@ -1346,6 +1375,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 		DispatchMessage(&msg);
 	}
 
+	stopSensorThread();   // join first: the watchers below free the handles it reads
 	orient_watch_shutdown();
 	als_watch_shutdown();
 	GdiplusShutdown(gdiplusToken);
