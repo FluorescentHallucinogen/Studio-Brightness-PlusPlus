@@ -33,6 +33,7 @@ struct OrientationDevice {
 	std::wstring         devicePath;
 	std::wstring         gdiName; // \\.\DISPLAYx (resolved lazily)
 	LONG                 lastX = LONG_MIN, lastY = LONG_MIN, lastZ = LONG_MIN;
+	int                  failures = 0;   // consecutive failed reads; drives re-enumeration
 
 	OrientationDevice() = default;
 	~OrientationDevice() { close(); }

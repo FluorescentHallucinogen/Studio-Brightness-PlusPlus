@@ -33,7 +33,7 @@ void OrientationDevice::moveFrom(OrientationDevice &o) {
 	hDev = o.hDev; prep = o.prep; inputLen = o.inputLen; reportId = o.reportId;
 	uX = o.uX; uY = o.uY; uZ = o.uZ; overlapped = o.overlapped; containerId = o.containerId;
 	devicePath = std::move(o.devicePath); gdiName = std::move(o.gdiName);
-	lastX = o.lastX; lastY = o.lastY; lastZ = o.lastZ;
+	lastX = o.lastX; lastY = o.lastY; lastZ = o.lastZ; failures = o.failures;
 	o.hDev = INVALID_HANDLE_VALUE; o.prep = nullptr;
 }
 
@@ -62,7 +62,10 @@ bool OrientationDevice::readReport(std::vector<uint8_t> &buf) {
 			buf.assign(rb.begin(), rb.end());
 			ok = true;
 		} else {
+			// CancelIo does not wait. rb and ov are on this stack frame, so we have to block
+			// until the I/O is really done before unwinding.
 			CancelIo(hDev);
+			GetOverlappedResult(hDev, &ov, &got, TRUE);
 		}
 	}
 	CloseHandle(ov.hEvent);
@@ -286,26 +289,63 @@ bool orient_apply_rotation(const std::wstring &gdiName, int dmdo) {
 
 /* ============================ Watcher ============================ */
 
-static std::vector<OrientationDevice> g_orient;
-static std::atomic<bool>              g_orientEnabled{true};
+// A preset switch re-enumerates the display's HID interfaces, and so does a sleep cycle, which
+// kills these handles for good. Nothing re-opened them, so auto-rotation just stopped until the
+// next launch. Re-scan once every device has stopped answering; back off to 30 s when there has
+// never been a sensor (no null driver), to avoid a SetupDi sweep every 3 s forever.
+constexpr int   kOrientMaxFailures  = 8;      // ~2 s at the 250 ms poll interval
+constexpr DWORD kOrientRescanFastMs = 3000;   // a sensor was there and went away
+constexpr DWORD kOrientRescanSlowMs = 30000;  // there has never been one
+
+static std::vector<OrientationDevice> g_orient;          // sensor thread only, after init
+static std::atomic<bool>              g_orientEnabled{false};
+static std::atomic<bool>              g_orientReapply{false};
+static bool                           g_orientEverFound = false;
+static DWORD                          g_orientLastScan  = 0;
 
 void orient_set_enabled(bool enabled) {
-	bool was = g_orientEnabled.exchange(enabled);
-	if (enabled && !was) {
-		// Re-apply the current physical orientation on the next tick.
-		for (auto &d : g_orient) { d.lastX = d.lastY = d.lastZ = LONG_MIN; }
-	}
+	const bool was = g_orientEnabled.exchange(enabled);
+	// Called from the UI thread; the device list belongs to the sensor thread. Flag only.
+	if (enabled && !was) g_orientReapply.store(true);
 }
 
 void orient_watch_init() {
 	g_orient = orient_enumerate();
+	g_orientEverFound = !g_orient.empty();
+	g_orientLastScan  = GetTickCount();
+}
+
+static void orientRescanIfNeeded() {
+	bool anyAlive = false;
+	for (const auto &d : g_orient)
+		if (d.isOpen() && d.failures < kOrientMaxFailures) { anyAlive = true; break; }
+	if (anyAlive) return;
+
+	const DWORD now  = GetTickCount();
+	const DWORD wait = g_orientEverFound ? kOrientRescanFastMs : kOrientRescanSlowMs;
+	if (now - g_orientLastScan < wait) return;
+	g_orientLastScan = now;
+
+	const bool had = !g_orient.empty();
+	g_orient.clear();               // destructors close the dead handles
+	g_orient = orient_enumerate();
+	if (!g_orient.empty()) {
+		g_orientEverFound = true;
+		g_orientReapply.store(true);  // the panel may have been turned while we were blind
+		if (had) Log::Info(L"orient: sensor re-acquired after the interface went away");
+	}
 }
 
 void orient_watch_tick() {
+	orientRescanIfNeeded();
 	if (!g_orientEnabled.load()) return;
+	if (g_orientReapply.exchange(false))
+		for (auto &d : g_orient) { d.lastX = d.lastY = d.lastZ = LONG_MIN; }
+
 	for (auto &d : g_orient) {
 		LONG x = LONG_MIN, y = LONG_MIN, z = LONG_MIN;
-		if (!d.readTilt(&x, &y, &z)) continue;
+		if (!d.readTilt(&x, &y, &z)) { ++d.failures; continue; }
+		d.failures = 0;
 		if (x == d.lastX && y == d.lastY && z == d.lastZ) continue; // log only on real change
 		Log::Info(L"orient: tilt X=%ld Y=%ld Z=%ld (%s)", x, y, z,
 		          d.gdiName.empty() ? L"?" : d.gdiName.c_str());
