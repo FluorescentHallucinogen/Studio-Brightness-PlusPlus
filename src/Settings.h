@@ -16,7 +16,9 @@ struct HotkeySpec {
 struct AppSettings {
     // Core Brightness Logic
     std::atomic<bool> autoAdjustEnabled{true};
-    std::atomic<bool> autoRotateEnabled{true};
+    // Off by default: rotating the screen is a visible, disruptive action, and the setting
+    // appears on machines that never asked for it after an update.
+    std::atomic<bool> autoRotateEnabled{false};
     ULONG             brightnessSteps{10};
 
     // User Interface
