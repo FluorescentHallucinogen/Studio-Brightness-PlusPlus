@@ -9,6 +9,7 @@
 #include <shlwapi.h>
 #include <mutex>
 #include <cstring>
+#include <cmath>
 
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "setupapi.lib")
@@ -38,8 +39,11 @@ static std::wstring shortLabel(const wchar_t *path) {
 
 void AlsDevice::moveFrom(AlsDevice &o) {
 	hDev = o.hDev; prep = o.prep; inputLen = o.inputLen; reportId = o.reportId;
-	uIllum = o.uIllum; overlapped = o.overlapped; containerId = o.containerId;
-	devicePath = std::move(o.devicePath); label = std::move(o.label); lastRaw = o.lastRaw;
+	uIllum = o.uIllum; uTemp = o.uTemp; uChromaX = o.uChromaX; uChromaY = o.uChromaY;
+	eIllum = o.eIllum; eTemp = o.eTemp; eChromaX = o.eChromaX; eChromaY = o.eChromaY;
+	overlapped = o.overlapped; containerId = o.containerId;
+	devicePath = std::move(o.devicePath); label = std::move(o.label);
+	lastRaw = o.lastRaw; lastLogTick = o.lastLogTick; failures = o.failures;
 	o.hDev = INVALID_HANDLE_VALUE; o.prep = nullptr;
 }
 
@@ -66,27 +70,50 @@ bool AlsDevice::readReport(std::vector<uint8_t> &buf) {
 			buf.assign(rb.begin(), rb.end());
 			ok = true;
 		} else {
+			// CancelIo does not wait. rb and ov are on this stack frame, so we have to block
+			// until the I/O is really done before unwinding.
 			CancelIo(hDev);
+			GetOverlappedResult(hDev, &ov, &got, TRUE);
 		}
 	}
 	CloseHandle(ov.hEvent);
 	return ok;
 }
 
-bool AlsDevice::readLux(LONG *rawOut, float *luxOut) {
+// Unit exponent is a 4-bit signed nibble: 0..7 positive, 8..15 mean -8..-1.
+// Do NOT use HidP_GetScaledUsageValue here. It maps logical onto physical, and Apple leaves
+// PhysicalMin/Max at 0, which the spec reads as physical == logical, so it returns the raw
+// value and the exponent is silently dropped. Gen 1: 0x04D1 UnitExp 13, raw 35264 = 35.264 lux.
+static float unitScale(ULONG unitsExp) {
+	int n = (int)(unitsExp & 0x0Fu);
+	return std::pow(10.0f, (float)((n > 7) ? n - 16 : n));
+}
+
+static bool readField(PHIDP_PREPARSED_DATA prep, std::vector<uint8_t> &buf, USAGE u, ULONG *out) {
+	if (!u) return false;
+	return HidP_GetUsageValue(HidP_Input, HID_UP_SENSOR_PAGE, 0, u, out, prep,
+	                          reinterpret_cast<PCHAR>(buf.data()), (ULONG)buf.size()) == HIDP_STATUS_SUCCESS;
+}
+
+bool AlsDevice::readAmbient(LONG *rawOut, AmbientReading *out) {
 	if (!prep || !uIllum) return false;
 	std::vector<uint8_t> buf;
 	if (!readReport(buf)) return false;
 	ULONG v = 0;
-	if (HidP_GetUsageValue(HidP_Input, HID_UP_SENSOR_PAGE, 0, uIllum, &v, prep,
-	                       reinterpret_cast<PCHAR>(buf.data()), (ULONG)buf.size()) != HIDP_STATUS_SUCCESS)
-		return false;
-	LONG raw = (LONG)v;
-	LONG scaled = 0;
-	bool okS = HidP_GetScaledUsageValue(HidP_Input, HID_UP_SENSOR_PAGE, 0, uIllum, &scaled, prep,
-	                                    reinterpret_cast<PCHAR>(buf.data()), (ULONG)buf.size()) == HIDP_STATUS_SUCCESS;
-	if (rawOut) *rawOut = raw;
-	if (luxOut) *luxOut = okS ? (float)scaled : (float)raw;
+	if (!readField(prep, buf, uIllum, &v)) return false;
+	if (rawOut) *rawOut = (LONG)v;
+	if (!out) return true;
+
+	*out = AmbientReading{};
+	out->lux = (float)v * unitScale(eIllum);
+	ULONG t = 0, cx = 0, cy = 0;
+	const bool okT = readField(prep, buf, uTemp, &t);
+	const bool okX = readField(prep, buf, uChromaX, &cx);
+	const bool okY = readField(prep, buf, uChromaY, &cy);
+	if (okT) out->colorTemp = (float)t * unitScale(eTemp);
+	if (okX) out->chromaX   = (float)cx * unitScale(eChromaX);
+	if (okY) out->chromaY   = (float)cy * unitScale(eChromaY);
+	out->hasColour = okT || (okX && okY);
 	return true;
 }
 
@@ -137,14 +164,28 @@ std::vector<AlsDevice> als_enumerate() {
 		HIDP_CAPS caps{};
 		if (HidP_GetCaps(prep, &caps) != HIDP_STATUS_SUCCESS) { HidD_FreePreparsedData(prep); CloseHandle(h); continue; }
 
-		USAGE uIllum = 0; UCHAR reportId = 0;
+		// Illuminance is the one we need; CCT and chromaticity share its report. Each field
+		// carries its own unit exponent.
+		USAGE uIllum = 0, uTemp = 0, uChromaX = 0, uChromaY = 0;
+		ULONG eIllum = 0, eTemp = 0, eChromaX = 0, eChromaY = 0;
+		UCHAR reportId = 0;
 		USHORT n = caps.NumberInputValueCaps;
 		if (n) {
 			std::vector<HIDP_VALUE_CAPS> v(n);
 			if (HidP_GetValueCaps(HidP_Input, v.data(), &n, prep) == HIDP_STATUS_SUCCESS) {
 				for (USHORT k = 0; k < n; ++k) {
 					if (v[k].UsagePage != HID_UP_SENSOR_PAGE || v[k].IsRange) continue;
-					if (v[k].NotRange.Usage == HID_USG_ILLUMINANCE) { uIllum = v[k].NotRange.Usage; reportId = v[k].ReportID; break; }
+					switch (v[k].NotRange.Usage) {
+					case HID_USG_ILLUMINANCE:
+						uIllum = HID_USG_ILLUMINANCE; eIllum = v[k].UnitsExp; reportId = v[k].ReportID; break;
+					case HID_USG_COLOR_TEMP:
+						uTemp = HID_USG_COLOR_TEMP; eTemp = v[k].UnitsExp; break;
+					case HID_USG_CHROMA_X:
+						uChromaX = HID_USG_CHROMA_X; eChromaX = v[k].UnitsExp; break;
+					case HID_USG_CHROMA_Y:
+						uChromaY = HID_USG_CHROMA_Y; eChromaY = v[k].UnitsExp; break;
+					default: break;
+					}
 				}
 			}
 		}
@@ -153,15 +194,24 @@ std::vector<AlsDevice> als_enumerate() {
 
 		AlsDevice d;
 		d.hDev = h; d.prep = prep; d.inputLen = caps.InputReportByteLength;
-		d.reportId = reportId; d.uIllum = uIllum; d.overlapped = true;
+		d.reportId = reportId; d.overlapped = true;
+		d.uIllum = uIllum; d.uTemp = uTemp; d.uChromaX = uChromaX; d.uChromaY = uChromaY;
+		d.eIllum = eIllum; d.eTemp = eTemp; d.eChromaX = eChromaX; d.eChromaY = eChromaY;
 		d.devicePath = path;
 		d.label = shortLabel(path);
 		d.containerId = queryContainerIdFromDevinfo(set, &devInfo);
 
-		LONG raw = 0; float lux = 0.f;
-		bool okRead = d.readLux(&raw, &lux);
-		Log::Info(L"als: illuminance sensor %s (reportId=0x%02X) testRead=%s raw=%ld lux=%.1f",
-		          d.label.c_str(), reportId, okRead ? L"ok" : L"FAILED", okRead ? raw : -1, okRead ? lux : -1.f);
+		// Log the raw exponents: on an unfamiliar model this line is what tells us how to
+		// scale that panel.
+		LONG raw = 0; AmbientReading amb;
+		const bool okRead = d.readAmbient(&raw, &amb);
+		Log::Info(L"als: illuminance sensor %s (reportId=0x%02X) testRead=%s raw=%ld lux=%.2f "
+		          L"unitExp[lux=%lu temp=%lu x=%lu y=%lu]",
+		          d.label.c_str(), reportId, okRead ? L"ok" : L"FAILED", okRead ? raw : -1,
+		          okRead ? amb.lux : -1.f, eIllum, eTemp, eChromaX, eChromaY);
+		if (okRead && amb.hasColour)
+			Log::Info(L"als: ambient colour %s: %.0f K, CIE x=%.4f y=%.4f (True Tone input)",
+			          d.label.c_str(), amb.colorTemp, amb.chromaX, amb.chromaY);
 		result.push_back(std::move(d));
 	}
 	SetupDiDestroyDeviceInfoList(set);
@@ -171,69 +221,101 @@ std::vector<AlsDevice> als_enumerate() {
 
 /* ============================ Watcher + snapshot ============================ */
 
-struct AlsSnap { GUID container; float lux; bool valid; };
+// Snapshot published to the worker thread. `tick` is when the sample was taken, so a
+// display that stops answering ages out instead of pinning auto-brightness forever.
+struct AlsSnap { GUID container; AmbientReading amb; DWORD tick; bool valid; };
 
 static std::vector<AlsDevice> g_als;
 static std::vector<AlsSnap>   g_alsSnap;      // parallel to g_als; read by als_get_lux
 static std::mutex             g_alsSnapMtx;
 
-// A HID sensor powers up in "No Events" and streams nothing until a host writes its
-// Reporting State feature (usage 0x0316) = All Events (2). The Windows sensor mapper does
-// this automatically; when we read the raw HID interface ourselves we must do it too, or
-// every input read times out and no lux is ever produced.
-static bool alsFeatureReportId(PHIDP_PREPARSED_DATA prep, USAGE usage, UCHAR *rid) {
-	HIDP_CAPS caps{};
-	if (HidP_GetCaps(prep, &caps) != HIDP_STATUS_SUCCESS || caps.NumberFeatureValueCaps == 0) return false;
-	USHORT n = caps.NumberFeatureValueCaps;
-	std::vector<HIDP_VALUE_CAPS> v(n);
-	if (HidP_GetValueCaps(HidP_Feature, v.data(), &n, prep) != HIDP_STATUS_SUCCESS) return false;
-	for (auto &c : v) {
-		USAGE u = c.IsRange ? c.Range.UsageMin : c.NotRange.Usage;
-		if (c.UsagePage == HID_UP_SENSOR_PAGE && u == usage) { if (rid) *rid = c.ReportID; return true; }
-	}
-	return false;
-}
+// Do not add a Reporting State (0x0316) write back here. It is a named array on this panel,
+// so it sits in the Feature BUTTON caps as selectors 0x0840/0x0841 and a value-caps lookup
+// never finds it. Unnecessary anyway: HidD_GetInputReport answers whatever the reporting
+// state, same as Boot Camp. Keeps us from writing anything to the sensor interface.
 
-static void alsEnableReporting(AlsDevice &d) {
-	if (d.hDev == INVALID_HANDLE_VALUE || !d.prep) return;
-	HIDP_CAPS caps{};
-	if (HidP_GetCaps(d.prep, &caps) != HIDP_STATUS_SUCCESS || caps.FeatureReportByteLength == 0) return;
-	UCHAR rid = 0;
-	if (!alsFeatureReportId(d.prep, 0x0316, &rid)) return;   // 0x0316 = Property: Reporting State
-	std::vector<uint8_t> buf(caps.FeatureReportByteLength, 0);
-	buf[0] = rid;
-	HidD_GetFeature(d.hDev, buf.data(), (ULONG)buf.size());  // read-modify-write; ok if this fails
-	HidP_SetUsageValue(HidP_Feature, HID_UP_SENSOR_PAGE, 0, 0x0316, 2, d.prep,   // 2 = All Events
-	                   reinterpret_cast<PCHAR>(buf.data()), (ULONG)buf.size());
-	UCHAR ridInt = 0;
-	if (alsFeatureReportId(d.prep, 0x030E, &ridInt) && ridInt == rid)            // 0x030E = Report Interval
-		HidP_SetUsageValue(HidP_Feature, HID_UP_SENSOR_PAGE, 0, 0x030E, 500, d.prep,
-		                   reinterpret_cast<PCHAR>(buf.data()), (ULONG)buf.size());
-	if (HidD_SetFeature(d.hDev, buf.data(), (ULONG)buf.size()))
-		Log::Info(L"als: reporting enabled (%s)", d.label.c_str());
-	else
-		Log::Warn(L"als: enable reporting failed gle=%lu (%s)", GetLastError(), d.label.c_str());
+// Same as the orientation watcher: a preset switch or a sleep cycle re-enumerates the HID
+// interfaces and kills these handles. Re-scan once everything has stopped answering; back off
+// to 30 s when there has never been a sensor, so a machine without the null driver is not
+// running a SetupDi sweep every 3 s forever.
+constexpr int   kAlsMaxFailures  = 8;      // ~2 s at the 250 ms poll interval
+constexpr DWORD kAlsRescanFastMs = 3000;
+constexpr DWORD kAlsRescanSlowMs = 30000;
+
+static bool  g_alsEverFound = false;
+static DWORD g_alsLastScan  = 0;
+
+// Rebuilds the snapshot alongside the device list; the two are matched by index.
+static void alsPublishFresh() {
+	const DWORD now = GetTickCount();
+	std::lock_guard<std::mutex> lk(g_alsSnapMtx);
+	g_alsSnap.assign(g_als.size(), AlsSnap{});
+	for (size_t i = 0; i < g_als.size(); ++i) {
+		g_alsSnap[i].container = g_als[i].containerId;
+		AmbientReading amb;
+		if (g_als[i].readAmbient(nullptr, &amb)) {
+			g_alsSnap[i].amb = amb; g_alsSnap[i].tick = now; g_alsSnap[i].valid = true;
+		}
+	}
 }
 
 void als_watch_init() {
 	g_als = als_enumerate();
-	for (auto &d : g_als) alsEnableReporting(d);
-	std::lock_guard<std::mutex> lk(g_alsSnapMtx);
-	g_alsSnap.clear();
-	for (auto &d : g_als) g_alsSnap.push_back({d.containerId, 0.f, false});
+	// Seed with a real sample now: the worker anchors baseLux when it opens the device, which
+	// is well before the first 250 ms tick. An empty snapshot there means it anchors on the
+	// 100 lux placeholder instead.
+	alsPublishFresh();
+	g_alsEverFound = !g_als.empty();
+	g_alsLastScan  = GetTickCount();
+}
+
+static void alsRescanIfNeeded() {
+	bool anyAlive = false;
+	for (const auto &d : g_als)
+		if (d.isOpen() && d.failures < kAlsMaxFailures) { anyAlive = true; break; }
+	if (anyAlive) return;
+
+	const DWORD now  = GetTickCount();
+	const DWORD wait = g_alsEverFound ? kAlsRescanFastMs : kAlsRescanSlowMs;
+	if (now - g_alsLastScan < wait) return;
+	g_alsLastScan = now;
+
+	const bool had = !g_als.empty();
+	g_als.clear();                  // destructors close the dead handles
+	g_als = als_enumerate();
+	alsPublishFresh();
+	if (!g_als.empty()) {
+		g_alsEverFound = true;
+		if (had) Log::Info(L"als: sensor re-acquired after the interface went away");
+	}
 }
 
 void als_watch_tick() {
+	alsRescanIfNeeded();
 	for (size_t i = 0; i < g_als.size(); ++i) {
-		LONG raw = 0; float lux = 0.f;
-		if (!g_als[i].readLux(&raw, &lux)) continue;
+		LONG raw = 0; AmbientReading amb;
+		if (!g_als[i].readAmbient(&raw, &amb)) { ++g_als[i].failures; continue; }
+		g_als[i].failures = 0;
+		const DWORD now = GetTickCount();
 		{
 			std::lock_guard<std::mutex> lk(g_alsSnapMtx);
-			if (i < g_alsSnap.size()) { g_alsSnap[i].lux = lux; g_alsSnap[i].valid = true; }
+			if (i < g_alsSnap.size()) {
+				g_alsSnap[i].amb = amb; g_alsSnap[i].tick = now; g_alsSnap[i].valid = true;
+			}
 		}
-		if (raw == g_als[i].lastRaw) continue;             // log only on change
-		Log::Info(L"als: illuminance raw=%ld lux=%.1f (%s)", raw, lux, g_als[i].label.c_str());
+		// Noisy sensor: every change is several lines a second, and one fsync each with file
+		// logging on. Only log a 5% move, 2 s apart at most.
+		const LONG last = g_als[i].lastRaw;
+		const LONG delta = (last == LONG_MIN) ? raw : (raw > last ? raw - last : last - raw);
+		const LONG threshold = (last == LONG_MIN) ? 0 : (last / 20 + 1);
+		if (last != LONG_MIN && (delta < threshold || now - g_als[i].lastLogTick < 2000)) continue;
+		if (amb.hasColour)
+			Log::Info(L"als: %s raw=%ld lux=%.2f %.0fK x=%.4f y=%.4f",
+			          g_als[i].label.c_str(), raw, amb.lux, amb.colorTemp, amb.chromaX, amb.chromaY);
+		else
+			Log::Info(L"als: %s raw=%ld lux=%.2f", g_als[i].label.c_str(), raw, amb.lux);
 		g_als[i].lastRaw = raw;
+		g_als[i].lastLogTick = now;
 	}
 }
 
@@ -245,16 +327,25 @@ void als_watch_shutdown() {
 	g_als.clear();
 }
 
-bool als_get_lux(const GUID *containerId, float *lux) {
-	if (!lux) return false;
+bool als_get_ambient(const GUID *containerId, AmbientReading *out) {
+	if (!out) return false;
 	std::lock_guard<std::mutex> lk(g_alsSnapMtx);
 	static const GUID zero = {};
-	if (containerId && memcmp(containerId, &zero, sizeof(GUID)) != 0) {
-		for (const auto &s : g_alsSnap)
-			if (s.valid && memcmp(&s.container, containerId, sizeof(GUID)) == 0) { *lux = s.lux; return true; }
-		return false;   // no ContainerId-matched raw ALS
+	const DWORD now = GetTickCount();
+	const bool wantMatch = containerId && memcmp(containerId, &zero, sizeof(GUID)) != 0;
+	for (const auto &s : g_alsSnap) {
+		if (!s.valid || now - s.tick > kAlsMaxAgeMs) continue;   // stale: let the caller fall back
+		if (wantMatch && memcmp(&s.container, containerId, sizeof(GUID)) != 0) continue;
+		*out = s.amb;
+		return true;
 	}
-	for (const auto &s : g_alsSnap)
-		if (s.valid) { *lux = s.lux; return true; }   // master
-	return false;
+	return false;   // no fresh raw-HID reading for this display
+}
+
+bool als_get_lux(const GUID *containerId, float *lux) {
+	if (!lux) return false;
+	AmbientReading a;
+	if (!als_get_ambient(containerId, &a)) return false;
+	*lux = a.lux;
+	return true;
 }
