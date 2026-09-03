@@ -215,7 +215,7 @@ std::vector<AlsDevice> als_enumerate() {
 		result.push_back(std::move(d));
 	}
 	SetupDiDestroyDeviceInfoList(set);
-	Log::Info(L"als: %zu illuminance sensor(s) found (raw HID)", result.size());
+	Log::Info(L"ALS: %zu ambient light sensor(s) via raw HID", result.size());
 	return result;
 }
 

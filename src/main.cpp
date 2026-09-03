@@ -389,13 +389,13 @@ static void initAlsSensors() {
 
 	ComPtr<ISensorCollection> col;
 	if (FAILED(mgr->GetSensorsByType(SENSOR_TYPE_AMBIENT_LIGHT, &col))) {
-		Log::Info(L"ALS: No ambient light sensors found");
+		Log::Info(L"ALS: no ambient light sensor via the Windows Sensor API");
 		return;
 	}
 
 	ULONG count = 0;
 	col->GetCount(&count);
-	Log::Info(L"ALS: Found %lu ambient light sensor(s)", count);
+	Log::Info(L"ALS: %lu ambient light sensor(s) via the Windows Sensor API", count);
 
 	std::lock_guard<std::mutex> lock(g_alsMutex);
 
