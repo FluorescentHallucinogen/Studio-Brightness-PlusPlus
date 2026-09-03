@@ -333,13 +333,16 @@ bool als_get_ambient(const GUID *containerId, AmbientReading *out) {
 	static const GUID zero = {};
 	const DWORD now = GetTickCount();
 	const bool wantMatch = containerId && memcmp(containerId, &zero, sizeof(GUID)) != 0;
+	// A display can carry more than one sensor (the XDRs have a front and a rear one). Take
+	// the brightest fresh reading, like Boot Camp does: a covered or shadowed sensor can only
+	// under-read, so the max is the one that still tracks the room.
+	bool found = false;
 	for (const auto &s : g_alsSnap) {
 		if (!s.valid || now - s.tick > kAlsMaxAgeMs) continue;   // stale: let the caller fall back
 		if (wantMatch && memcmp(&s.container, containerId, sizeof(GUID)) != 0) continue;
-		*out = s.amb;
-		return true;
+		if (!found || s.amb.lux > out->lux) { *out = s.amb; found = true; }
 	}
-	return false;   // no fresh raw-HID reading for this display
+	return found;   // false: no fresh raw-HID reading for this display
 }
 
 bool als_get_lux(const GUID *containerId, float *lux) {
