@@ -63,19 +63,22 @@ std::vector<OrientationDevice> orient_enumerate();
    constants in the .cpp if rotation goes the wrong way. */
 int orient_angle_to_dmdo(LONG tiltYdeg);
 
-/* Apply a rotation to a GDI display ("\\.\DISPLAYx"). */
-bool orient_apply_rotation(const std::wstring &gdiName, int dmdo);
+/* Apply a rotation to a GDI display ("\\.\DISPLAYx").
+   Returns 1 if the display was rotated, 0 if it was already there, -1 on failure. */
+int orient_apply_rotation(const std::wstring &gdiName, int dmdo);
 
 /* Resolve "\\.\DISPLAYx" for this sensor: by ContainerId first, then by Apple EDID
    (first active non-internal Apple display). Empty on failure. */
 std::wstring orient_resolve_display(const OrientationDevice &d);
 
 /* Enable/disable auto-rotation at runtime (driven by the Options / tray setting).
-   Enabling re-applies the current physical orientation on the next tick. */
+   Turning it on from the UI applies the current physical orientation once; startup and
+   reconnects only take a baseline and wait for the panel to actually move. */
 void orient_set_enabled(bool enabled);
 
-/* Convenience watcher: init once (UI thread), tick from a ~250 ms WM_TIMER, shutdown at exit. */
-void orient_watch_init();
+/* Watcher: init once with the saved setting (UI thread), tick from the sensor thread,
+   shutdown at exit. */
+void orient_watch_init(bool enabled);
 void orient_watch_tick();
 void orient_watch_shutdown();
 

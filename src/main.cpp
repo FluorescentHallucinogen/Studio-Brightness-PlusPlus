@@ -1356,8 +1356,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
 	// Before startWorker: the worker anchors baseLux from the first reading it can get, so the
 	// raw-HID ALS has to be up and carrying a real sample by then.
-	orient_watch_init();                        // discover Apple orientation sensors (MI_09)
-	orient_set_enabled(g_settings.autoRotateEnabled.load());
+	orient_watch_init(g_settings.autoRotateEnabled.load()); // discover Apple orientation sensors (MI_09)
 	als_watch_init();                           // discover Apple raw-HID ALS (MI_08 illuminance)
 	startSensorThread();                        // poll both off the UI thread
 	startWorker();
