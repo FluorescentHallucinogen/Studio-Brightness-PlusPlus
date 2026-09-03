@@ -33,7 +33,7 @@ void OrientationDevice::moveFrom(OrientationDevice &o) {
 	hDev = o.hDev; prep = o.prep; inputLen = o.inputLen; reportId = o.reportId;
 	uX = o.uX; uY = o.uY; uZ = o.uZ; overlapped = o.overlapped; containerId = o.containerId;
 	devicePath = std::move(o.devicePath); gdiName = std::move(o.gdiName);
-	lastX = o.lastX; lastY = o.lastY; lastZ = o.lastZ;
+	lastX = o.lastX; lastY = o.lastY; lastZ = o.lastZ; failures = o.failures;
 	o.hDev = INVALID_HANDLE_VALUE; o.prep = nullptr;
 }
 
@@ -62,7 +62,10 @@ bool OrientationDevice::readReport(std::vector<uint8_t> &buf) {
 			buf.assign(rb.begin(), rb.end());
 			ok = true;
 		} else {
+			// CancelIo does not wait. rb and ov are on this stack frame, so we have to block
+			// until the I/O is really done before unwinding.
 			CancelIo(hDev);
+			GetOverlappedResult(hDev, &ov, &got, TRUE);
 		}
 	}
 	CloseHandle(ov.hEvent);
@@ -268,48 +271,94 @@ int orient_angle_to_dmdo(LONG a) {
 	return DMDO_270;
 }
 
-bool orient_apply_rotation(const std::wstring &gdiName, int dmdo) {
-	if (gdiName.empty() || dmdo < 0) return false;
+int orient_apply_rotation(const std::wstring &gdiName, int dmdo) {
+	if (gdiName.empty() || dmdo < 0) return -1;
 	DEVMODEW dm{}; dm.dmSize = sizeof(dm);
-	if (!EnumDisplaySettingsW(gdiName.c_str(), ENUM_CURRENT_SETTINGS, &dm)) return false;
-	if ((int)dm.dmDisplayOrientation == dmdo) return true;
+	if (!EnumDisplaySettingsW(gdiName.c_str(), ENUM_CURRENT_SETTINGS, &dm)) return -1;
+	if ((int)dm.dmDisplayOrientation == dmdo) return 0;
 	bool curPortrait = (dm.dmDisplayOrientation == DMDO_90 || dm.dmDisplayOrientation == DMDO_270);
 	bool newPortrait = (dmdo == DMDO_90 || dmdo == DMDO_270);
 	if (curPortrait != newPortrait) std::swap(dm.dmPelsWidth, dm.dmPelsHeight);
 	dm.dmDisplayOrientation = (DWORD)dmdo;
 	dm.dmFields = DM_DISPLAYORIENTATION | DM_PELSWIDTH | DM_PELSHEIGHT;
 	LONG r = ChangeDisplaySettingsExW(gdiName.c_str(), &dm, nullptr, CDS_UPDATEREGISTRY, nullptr);
-	if (r != DISP_CHANGE_SUCCESSFUL)
+	if (r != DISP_CHANGE_SUCCESSFUL) {
 		Log::Warn(L"orient: ChangeDisplaySettingsEx(%s) returned %ld", gdiName.c_str(), r);
-	return r == DISP_CHANGE_SUCCESSFUL;
+		return -1;
+	}
+	return 1;
 }
 
 /* ============================ Watcher ============================ */
 
-static std::vector<OrientationDevice> g_orient;
-static std::atomic<bool>              g_orientEnabled{true};
+// A preset switch re-enumerates the display's HID interfaces, and so does a sleep cycle, which
+// kills these handles for good. Nothing re-opened them, so auto-rotation just stopped until the
+// next launch. Re-scan once every device has stopped answering; back off to 30 s when there has
+// never been a sensor (no null driver), to avoid a SetupDi sweep every 3 s forever.
+constexpr int   kOrientMaxFailures  = 8;      // ~2 s at the 250 ms poll interval
+constexpr DWORD kOrientRescanFastMs = 3000;   // a sensor was there and went away
+constexpr DWORD kOrientRescanSlowMs = 30000;  // there has never been one
+
+static std::vector<OrientationDevice> g_orient;          // sensor thread only, after init
+static std::atomic<bool>              g_orientEnabled{false};
+static std::atomic<bool>              g_orientReapply{false};
+static bool                           g_orientEverFound = false;
+static DWORD                          g_orientLastScan  = 0;
 
 void orient_set_enabled(bool enabled) {
-	bool was = g_orientEnabled.exchange(enabled);
-	if (enabled && !was) {
-		// Re-apply the current physical orientation on the next tick.
-		for (auto &d : g_orient) { d.lastX = d.lastY = d.lastZ = LONG_MIN; }
+	const bool was = g_orientEnabled.exchange(enabled);
+	// Called from the UI thread; the device list belongs to the sensor thread. Flag only.
+	if (enabled && !was) g_orientReapply.store(true);
+}
+
+void orient_watch_init(bool enabled) {
+	g_orientEnabled.store(enabled);   // no re-apply: startup only takes a baseline
+	g_orient = orient_enumerate();
+	g_orientEverFound = !g_orient.empty();
+	g_orientLastScan  = GetTickCount();
+}
+
+static void orientRescanIfNeeded() {
+	bool anyAlive = false;
+	for (const auto &d : g_orient)
+		if (d.isOpen() && d.failures < kOrientMaxFailures) { anyAlive = true; break; }
+	if (anyAlive) return;
+
+	const DWORD now  = GetTickCount();
+	const DWORD wait = g_orientEverFound ? kOrientRescanFastMs : kOrientRescanSlowMs;
+	if (now - g_orientLastScan < wait) return;
+	g_orientLastScan = now;
+
+	const bool had = !g_orient.empty();
+	g_orient.clear();               // destructors close the dead handles
+	g_orient = orient_enumerate();
+	if (!g_orient.empty()) {
+		g_orientEverFound = true;
+		if (had) Log::Info(L"orient: sensor re-acquired after the interface went away");
 	}
 }
 
-void orient_watch_init() {
-	g_orient = orient_enumerate();
-}
-
 void orient_watch_tick() {
+	orientRescanIfNeeded();
 	if (!g_orientEnabled.load()) return;
+	const bool reapply = g_orientReapply.exchange(false);
+
 	for (auto &d : g_orient) {
 		LONG x = LONG_MIN, y = LONG_MIN, z = LONG_MIN;
-		if (!d.readTilt(&x, &y, &z)) continue;
-		if (x == d.lastX && y == d.lastY && z == d.lastZ) continue; // log only on real change
-		Log::Info(L"orient: tilt X=%ld Y=%ld Z=%ld (%s)", x, y, z,
-		          d.gdiName.empty() ? L"?" : d.gdiName.c_str());
-		d.lastX = x; d.lastY = y; d.lastZ = z;
+		if (!d.readTilt(&x, &y, &z)) { ++d.failures; continue; }
+		d.failures = 0;
+		const bool first   = (d.lastY == LONG_MIN);
+		const bool changed = first || x != d.lastX || y != d.lastY || z != d.lastZ;
+		if (!changed && !reapply) continue;
+		if (changed) {
+			Log::Info(L"orient: tilt X=%ld Y=%ld Z=%ld (%s)", x, y, z,
+			          d.gdiName.empty() ? L"?" : d.gdiName.c_str());
+			d.lastX = x; d.lastY = y; d.lastZ = z;
+		}
+		// The first reading after startup or a reconnect is a baseline only. Whatever the user
+		// has set in Windows stands until the panel is actually seen to move. The one exception
+		// is the user turning auto-rotate on from the menu, which applies straight away.
+		if (first && !reapply) continue;
 
 		int dmdo = orient_angle_to_dmdo(y); // Tilt Y drives rotation (Boot Camp parity)
 		if (dmdo < 0) continue;
@@ -317,7 +366,7 @@ void orient_watch_tick() {
 		if (d.gdiName.empty()) d.gdiName = orient_resolve_display(d);
 		if (d.gdiName.empty()) { Log::Warn(L"orient: no target display resolved; not rotating"); continue; }
 
-		if (orient_apply_rotation(d.gdiName, dmdo))
+		if (orient_apply_rotation(d.gdiName, dmdo) == 1)
 			Log::Info(L"orient: rotated %s to DMDO %d (tiltY=%ld)", d.gdiName.c_str(), dmdo, y);
 	}
 }
