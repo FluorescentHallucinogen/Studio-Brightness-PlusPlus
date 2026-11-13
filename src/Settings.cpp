@@ -39,6 +39,11 @@ void AppSettings::Load() {
         DWORD steps = GetRegDWORD(hKey, L"BrightnessSteps", 10);
         brightnessSteps = std::clamp(steps, kMinBrightnessSteps, kMaxBrightnessSteps);
 
+        DWORD brightenMs = GetRegDWORD(hKey, L"RampBrightenMs", kDefaultRampBrightenMs);
+        DWORD dimMs      = GetRegDWORD(hKey, L"RampDimMs", kDefaultRampDimMs);
+        rampBrightenMs.store(std::clamp(brightenMs, kMinRampMs, kMaxRampMs));
+        rampDimMs.store(std::clamp(dimMs, kMinRampMs, kMaxRampMs));
+
         linkedMode = (GetRegDWORD(hKey, L"LinkedMode", 1) != 0);
         activeDisplayIndex = GetRegDWORD(hKey, L"ActiveDisplayIndex", 0);
         updateChannel = (int)GetRegDWORD(hKey, L"UpdateChannel", 0);
@@ -64,6 +69,8 @@ void AppSettings::Save() {
         SetRegDWORD(hKey, L"HotkeyDownVK", hkDown.vk);
         
         SetRegDWORD(hKey, L"BrightnessSteps", brightnessSteps);
+        SetRegDWORD(hKey, L"RampBrightenMs", rampBrightenMs.load());
+        SetRegDWORD(hKey, L"RampDimMs", rampDimMs.load());
 
         SetRegDWORD(hKey, L"LinkedMode", linkedMode ? 1 : 0);
         SetRegDWORD(hKey, L"ActiveDisplayIndex", activeDisplayIndex);

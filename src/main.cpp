@@ -15,6 +15,7 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <map>
 #include <set>
@@ -38,6 +39,7 @@
 #include "PresetConfirm.h"
 #include "orientation.h"
 #include "als.h"
+#include "Dpi.h"
 
 #pragma comment(lib, "hid.lib")
 #pragma comment(lib, "sensorsapi.lib")
@@ -62,6 +64,8 @@ constexpr UINT     WMAPP_UPDATE_READY = WM_APP + 2;
 constexpr UINT_PTR ID_UPDATE_TIMER    = 0xA001;
 constexpr UINT_PTR ID_HDR_TIMER       = 0xA002;
 constexpr UINT_PTR ID_REAPPLY_TIMER   = 0xA003;
+constexpr UINT_PTR ID_OPTIONS_TIMER   = 0xA004; // Options dialog: keeps its brightness controls current
+constexpr UINT_PTR ID_TYPING_TIMER    = 0xA005; // Options dialog: a pause in typing into the percent field
 static std::atomic<bool> g_updateAvailable{false};
 static std::atomic<bool> g_updateChecking{false};
 static std::mutex        g_updateMutex;
@@ -154,9 +158,8 @@ static std::set<std::wstring>                           g_presetRestored;
 static ULONG_PTR gdiplusToken;
 
 // --- Apple-style auto-brightness transition (hysteresis + asymmetric perceptual ramp) ---
+// The two ramp durations are settings, edited in Options: g_settings.rampBrightenMs / rampDimMs.
 constexpr float  kRelLuxHysteresis = 0.20f;   // re-target only when |dLux|/lastTargetLux >= 20%
-constexpr double kRampBrightenMs   = 1500.0;  // fast brightening
-constexpr double kRampDimMs        = 5000.0;  // slow, gentle dimming
 
 static double brightToPerc(ULONG v) { return std::log2((double)v + 1.0); }
 static ULONG  percToBright(double l) { return (ULONG)std::llround(std::exp2(l) - 1.0); }
@@ -474,8 +477,11 @@ static void cleanupAlsSensors() {
 // Get lux from the best available sensor for a given display.
 // If the display has an ALS (matched by ContainerId), use it.
 // Otherwise use the master sensor (index 0 or user-selected).
-static float getAmbientLux(const DisplayDevice &dev) {
+// `live`, when given, says whether the value is a sensor's current reading or only the last
+// one that was known.
+static float getAmbientLux(const DisplayDevice &dev, bool *live = nullptr) {
 	std::lock_guard<std::mutex> lock(g_alsMutex);
+	if (live) *live = true;
 
 	// Prefer the raw-HID Apple ALS (the same source Boot Camp uses) matched to this display.
 	{
@@ -518,6 +524,7 @@ static float getAmbientLux(const DisplayDevice &dev) {
 	}
 
 	// No live sensor yet (e.g. just after an ALS re-init): use the last known value, not a hard default.
+	if (live) *live = false;
 	return g_lastKnownLux.load(std::memory_order_relaxed);
 }
 
@@ -649,6 +656,82 @@ static void adjustBrightnessByStep(int direction) {
 	}
 }
 
+/* ---------- manual brightness slider (tray popup and Options dialog) ---------- */
+// What a brightness slider needs to know about the active display. The tray popup and the
+// Options dialog both take it from here, so the two sliders show the same level and lock in
+// exactly the same situations.
+struct SliderState {
+	bool  hasDisplay    = false;
+	bool  hdr           = false; // Windows owns brightness while HDR is on
+	bool  locked        = false; // reference-mode preset: brightness is fixed (macOS locks it there too)
+	ULONG minBrightness = 1000;
+	ULONG maxBrightness = 60000;
+	ULONG brightness    = 0;
+
+	// What automatic brightness works from: the level last set by hand and the ambient light
+	// it was set in, and the ambient light now.
+	ULONG baseBrightness = 0;
+	float baseLux        = 0.f;
+	float lux            = 0.f;
+	bool  luxLive        = false; // false: no sensor is reporting, `lux` is only the last known value
+
+	bool usable() const { return hasDisplay && !hdr && !locked; }
+
+	// A level as a position on a 0-100 slider. Rounded to the nearest, so that a level set from
+	// a position reads back as that position.
+	int percentOf(ULONG level) const {
+		int range = (int)(maxBrightness - minBrightness);
+		if (range <= 0) range = 1;
+		float pct = (float)(level - minBrightness) / (float)range * 100.0f;
+		return (int)std::lround(std::clamp(pct, 0.0f, 100.0f));
+	}
+	int percent() const { return percentOf(brightness); }
+	int basePercent() const { return percentOf(baseBrightness); }
+};
+
+// Caller holds g_displayMutex.
+static SliderState sliderStateLocked() {
+	SliderState st;
+	st.hdr = g_hdrActive.load();
+	if (!g_displays.empty()) {
+		ULONG idx = std::min((ULONG)(g_displays.size() - 1), g_settings.activeDisplayIndex);
+		const auto &ref  = g_displays[idx];
+		st.hasDisplay    = true;
+		st.locked        = ref.activePresetLocksBrightness();
+		st.minBrightness = ref.minBrightness;
+		st.maxBrightness = ref.maxBrightness;
+		st.brightness    = ref.currentBrightness;
+		st.baseBrightness = ref.baseBrightness;
+		st.baseLux        = ref.baseLux;
+		st.lux            = getAmbientLux(ref, &st.luxLive);
+	}
+	return st;
+}
+
+static SliderState readSliderState() {
+	std::lock_guard<std::mutex> lock(g_displayMutex);
+	return sliderStateLocked();
+}
+
+// For UI timers. The worker keeps the display lock across HID I/O, which can take seconds on a
+// panel that is waking up: give up rather than stall the message pump, and catch up next time.
+static bool tryReadSliderState(SliderState &st) {
+	std::unique_lock<std::mutex> lock(g_displayMutex, std::try_to_lock);
+	if (!lock.owns_lock())
+		return false;
+	st = sliderStateLocked();
+	return true;
+}
+
+// Send a 0-100 slider position to the active display, or to all of them in linked mode.
+// Returns the brightness that was asked for.
+static ULONG applySliderPercent(int pct, ULONG refMin, ULONG refMax) {
+	ULONG r   = refMax - refMin;
+	ULONG val = refMin + (ULONG)((float)r * (float)pct / 100.0f);
+	ApplyBrightness(val, true, false);
+	return val;
+}
+
 /* ---------- Options Dialog ---------- */
 static void setDlgHotkey(HWND d, int ctrlId, const HotkeySpec &hk) {
 	BYTE f = 0;
@@ -669,14 +752,358 @@ static void getDlgHotkey(HWND d, int ctrlId, HotkeySpec &out) {
 	out = {mods, vk};
 }
 
+// Enable or disable a control. A control that is being disabled hands the focus on first, or
+// the keyboard would be left on a window that ignores it.
+static void enableDlgItem(HWND d, int ctrlId, bool enable) {
+	HWND c = GetDlgItem(d, ctrlId);
+	if (!c || (IsWindowEnabled(c) != FALSE) == enable)
+		return;
+	if (!enable && GetFocus() == c)
+		SendMessageW(d, WM_NEXTDLGCTL, 0, FALSE);
+	EnableWindow(c, enable);
+}
+
+// The ramp times: an edit box with a spin control, in milliseconds.
+static void initRampField(HWND d, int editId, int spinId, ULONG ms) {
+	UDACCEL step{0, 100}; // the arrows move by a tenth of a second
+	SendDlgItemMessageW(d, editId, EM_SETLIMITTEXT, 5, 0); // as many digits as kMaxRampMs
+	SendDlgItemMessageW(d, spinId, UDM_SETRANGE32, kMinRampMs, kMaxRampMs);
+	SendDlgItemMessageW(d, spinId, UDM_SETACCEL, 1, (LPARAM)&step);
+	SendDlgItemMessageW(d, spinId, UDM_SETPOS32, 0, ms);
+}
+// Read from the edit box rather than the spin control, so that a typed value outside the range
+// is clamped instead of dropped. An empty box keeps the current setting.
+static ULONG readRampField(HWND d, int editId, ULONG current) {
+	BOOL ok = FALSE;
+	UINT ms = GetDlgItemInt(d, editId, &ok, FALSE);
+	return ok ? std::clamp((ULONG)ms, kMinRampMs, kMaxRampMs) : current;
+}
+// Automatic brightness as the dialog shows it: the checkbox available and ticked.
+static bool autoBrightnessTicked(HWND d) {
+	return IsWindowEnabled(GetDlgItem(d, IDC_AUTO_BRIGHTNESS)) &&
+	       IsDlgButtonChecked(d, IDC_AUTO_BRIGHTNESS) == BST_CHECKED;
+}
+// The ramp times only shape automatic changes (a manual change is applied at once), so they can
+// be edited only while automatic brightness is ticked.
+static void updateRampFields(HWND d) {
+	bool on = autoBrightnessTicked(d);
+	for (int ctrlId : {IDC_RAMP_BRIGHTEN, IDC_RAMP_BRIGHTEN_SPIN, IDC_RAMP_DIM, IDC_RAMP_DIM_SPIN})
+		enableDlgItem(d, ctrlId, on);
+}
+
+// The percent field next to the slider shows the slider position as a number, for typing an
+// exact level. s_fillingPercent tells our own updates of the box from the user's typing;
+// s_percentTyped marks a typed value that has not been sent to the display yet.
+static bool s_fillingPercent = false;
+static bool s_percentTyped   = false;
+
+static void setPercentField(HWND d, int pct) {
+	s_fillingPercent = true;
+	SendDlgItemMessageW(d, IDC_SLIDER_PERCENT_SPIN, UDM_SETPOS32, 0, pct);
+	s_fillingPercent = false;
+}
+
+// Send a level from the slider or the percent field to the display, and show it in both.
+// Applied at once, like the tray slider: brightness does not wait for Save.
+static void applyOptionsPercent(HWND d, int pct) {
+	KillTimer(d, ID_TYPING_TIMER);
+	s_percentTyped = false;
+
+	// If the display does not take the new level, nothing is remembered as matched, and the
+	// timer puts the controls back where the display really is.
+	HWND        slider  = GetDlgItem(d, IDC_BRIGHTNESS_SLIDER);
+	ULONG       matched = ~0ul;
+	SliderState st      = readSliderState();
+	if (st.usable()) {
+		ULONG asked = applySliderPercent(pct, st.minBrightness, st.maxBrightness);
+		if (readSliderState().brightness == asked)
+			matched = asked;
+	}
+	SetWindowLongPtrW(slider, GWLP_USERDATA, (LONG_PTR)matched);
+
+	if ((int)SendMessageW(slider, TBM_GETPOS, 0, 0) != pct)
+		SendMessageW(slider, TBM_SETPOS, TRUE, pct);
+	// Rewriting the box moves the caret, so leave it alone when it already says the same.
+	BOOL ok    = FALSE;
+	UINT shown = GetDlgItemInt(d, IDC_SLIDER_PERCENT, &ok, FALSE);
+	if (!ok || (int)shown != pct)
+		setPercentField(d, pct);
+}
+
+// Apply what was typed into the percent field. A box left empty goes back to the slider's value.
+static void commitPercentField(HWND d, bool leaving) {
+	KillTimer(d, ID_TYPING_TIMER);
+	BOOL ok    = FALSE;
+	UINT typed = GetDlgItemInt(d, IDC_SLIDER_PERCENT, &ok, FALSE);
+	if (ok && s_percentTyped)
+		applyOptionsPercent(d, (int)std::min(typed, 100u));
+	else if (!ok && leaving && IsWindowEnabled(GetDlgItem(d, IDC_BRIGHTNESS_SLIDER)))
+		setPercentField(d, (int)SendDlgItemMessageW(d, IDC_BRIGHTNESS_SLIDER, TBM_GETPOS, 0, 0));
+	s_percentTyped = false;
+}
+
+// With automatic brightness on, the level on screen drifts away from the one set by hand. The
+// line under the checkbox and a tick mark on the slider keep the two apart: what was set and in
+// what ambient light, and where that has led now. Both are blank while automatic brightness is
+// off or cannot work, when the two levels are the same thing. (The dialog is as wide as it is
+// so that this line fits with six-digit lux values, which is direct sunlight.)
+static std::wstring luxText(float lux) {
+	wchar_t buf[32];
+	swprintf_s(buf, lux < 10.f ? L"%.1f" : L"%.0f", lux);
+	return buf;
+}
+static void showAutoStatus(HWND d, const SliderState &st) {
+	bool         on = st.usable() && autoBrightnessTicked(d);
+	std::wstring text;
+	if (on && !st.luxLive) {
+		text = L"No ambient light reading, so there is nothing to follow";
+	} else if (on) {
+		wchar_t buf[160];
+		swprintf_s(buf, L"Set: %d %% at %s lx of ambient light \u00B7 Now: %d %% at %s lx of ambient light",
+		           st.basePercent(), luxText(st.baseLux).c_str(), st.percent(), luxText(st.lux).c_str());
+		text = buf;
+	}
+	wchar_t shown[160] = {};
+	GetDlgItemTextW(d, IDC_AUTO_STATUS, shown, 160);
+	if (text != shown) // rewriting the same text would only make it flicker
+		SetDlgItemTextW(d, IDC_AUTO_STATUS, text.c_str());
+
+	// The tick mark for the level that was set: the only tick the slider has (TBM_GETTIC gives -1
+	// when there is none). It is painted by drawSliderTick.
+	HWND slider = GetDlgItem(d, IDC_BRIGHTNESS_SLIDER);
+	int  tick   = on ? st.basePercent() : -1;
+	if ((int)SendMessageW(slider, TBM_GETTIC, 0, 0) != tick) {
+		SendMessageW(slider, TBM_CLEARTICS, TRUE, 0);
+		if (tick >= 0)
+			SendMessageW(slider, TBM_SETTIC, 0, tick);
+	}
+}
+
+// NM_CUSTOMDRAW of the slider. A trackbar that draws any tick also draws one at each end of its
+// range, and those two would only compete with the one tick that means something here. So the
+// control's own tick drawing is skipped, and the tick for the level that was set is drawn alone.
+static LRESULT drawSliderTick(const NMCUSTOMDRAW *cd) {
+	if (cd->dwDrawStage == CDDS_PREPAINT)
+		return CDRF_NOTIFYITEMDRAW;
+	if (cd->dwDrawStage != CDDS_ITEMPREPAINT || cd->dwItemSpec != TBCD_TICS)
+		return CDRF_DODEFAULT;
+
+	HWND slider = cd->hdr.hwndFrom;
+	int  x      = (int)SendMessageW(slider, TBM_GETTICPOS, 0, 0); // -1: no tick is set
+	if (x >= 0) {
+		int  dpi = DpiOfWindow(slider);
+		RECT thumb;
+		SendMessageW(slider, TBM_GETTHUMBRECT, 0, (LPARAM)&thumb);
+		RECT tick{x, thumb.bottom + DpiScale(2, dpi), x + DpiScale(1, dpi), thumb.bottom + DpiScale(7, dpi)};
+		FillRect(cd->hdc, &tick, GetSysColorBrush(COLOR_BTNTEXT));
+	}
+	return CDRF_SKIPDEFAULT;
+}
+
+// Bring the brightness controls in line with the active display: which ones are available and
+// where the slider sits. Runs when the dialog opens and then on a timer, because
+// auto-brightness, the brightness keys, HDR and the display itself all carry on meanwhile.
+static void showBrightnessState(HWND d, const SliderState &st, bool opening) {
+	// The slider locks exactly when the tray slider does. As in Boot Camp, its labels grey out with it.
+	for (int ctrlId : {IDC_BRIGHTNESS_SLIDER, IDC_SLIDER_DIM_LABEL, IDC_SLIDER_BRIGHT_LABEL,
+	                   IDC_SLIDER_PERCENT, IDC_SLIDER_PERCENT_SPIN, IDC_SLIDER_PERCENT_UNIT})
+		enableDlgItem(d, ctrlId, st.usable());
+
+	// Auto-brightness is unavailable while Windows owns brightness (HDR) and while a
+	// reference-mode preset fixes it (macOS locks it there too).
+	enableDlgItem(d, IDC_AUTO_BRIGHTNESS, !st.hdr && !st.locked);
+	updateRampFields(d);
+	showAutoStatus(d, st);
+
+	// Follow the display, but not mid-drag and not after the slider's own change: a position is
+	// coarser than the brightness it was mapped to, and mapping that back can nudge the thumb.
+	// GWLP_USERDATA remembers the brightness the position was last matched to (see WM_HSCROLL).
+	HWND slider = GetDlgItem(d, IDC_BRIGHTNESS_SLIDER);
+	if (st.hasDisplay && GetCapture() != slider &&
+	    (opening || (ULONG)GetWindowLongPtrW(slider, GWLP_USERDATA) != st.brightness)) {
+		SendMessageW(slider, TBM_SETPOS, TRUE, st.percent());
+		SetWindowLongPtrW(slider, GWLP_USERDATA, (LONG_PTR)st.brightness);
+		if (!s_percentTyped) // not over a number the user is in the middle of typing
+			setPercentField(d, st.percent());
+	}
+}
+
+// A tooltip window for longer, wrapped text. Owned by the dialog, so destroyed with it.
+static HWND createWrappedTooltip(HWND d) {
+	HWND tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASS, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+	                           0, 0, 0, 0, d, nullptr, g_hInst, nullptr);
+	if (tip) {
+		RECT width{0, 0, 180, 0}; // dialog units, so the wrap width follows the font and the DPI
+		MapDialogRect(d, &width);
+		SendMessageW(tip, TTM_SETMAXTIPWIDTH, 0, width.right);
+	}
+	return tip;
+}
+
+// Tooltip explaining the brightness steps, shown when hovering the field's label.
+static void addStepsHelp(HWND d) {
+	static const wchar_t kText[] =
+	    L"The number of steps the whole brightness range is divided into for the brightness shortcuts: "
+	    L"the keyboard's native brightness keys and the custom shortcuts set below.\r\n\r\n"
+	    L"One press changes brightness by (max - min) / steps, so fewer steps means a bigger change per press.";
+
+	HWND tip = createWrappedTooltip(d);
+	if (!tip)
+		return;
+	SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000); // long enough to read
+	TTTOOLINFOW ti = {sizeof(ti)};
+	ti.uFlags      = TTF_IDISHWND | TTF_SUBCLASS;
+	ti.hwnd        = d;
+	ti.uId         = (UINT_PTR)GetDlgItem(d, IDC_STEPS_LABEL);
+	ti.lpszText    = (LPWSTR)kText;
+	SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
+/* ---------- preset descriptions as tooltips on the dropdown items ---------- */
+// The display supplies a description with a preset (the text that also goes to the log). It is
+// shown next to the open dropdown for the item the mouse is over or the arrow keys have moved
+// to. A combo box does not report which item is hovered, so its list window is subclassed; this
+// state lives and dies with it.
+struct PresetTips {
+	HWND                      tip = nullptr;
+	std::vector<std::wstring> descs;                        // by position in the dropdown; empty = no description
+	int                       shown     = -1;               // position the tooltip is up for, -1 = hidden
+	POINT                     lastMouse = {LONG_MIN, LONG_MIN}; // screen position of the last real mouse move
+};
+constexpr UINT_PTR kPresetTipsSubclass = 1;
+
+static void hidePresetTip(HWND list, PresetTips *pt) {
+	if (pt->shown < 0)
+		return;
+	TTTOOLINFOW ti = {sizeof(ti)};
+	ti.hwnd        = list;
+	SendMessageW(pt->tip, TTM_TRACKACTIVATE, FALSE, (LPARAM)&ti);
+	pt->shown = -1;
+}
+
+static void showPresetTip(HWND list, PresetTips *pt, int item) {
+	if (item == pt->shown)
+		return;
+	hidePresetTip(list, pt);
+	if (item < 0 || item >= (int)pt->descs.size() || pt->descs[item].empty())
+		return;
+
+	TTTOOLINFOW ti = {sizeof(ti)};
+	ti.hwnd        = list;
+	ti.lpszText    = pt->descs[item].data();
+	SendMessageW(pt->tip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+
+	// Beside the list and level with the item, so that it covers none of the other items.
+	RECT lr, ir, tr;
+	GetWindowRect(list, &lr);
+	SendMessageW(list, LB_GETITEMRECT, item, (LPARAM)&ir);
+	MapWindowPoints(list, nullptr, (POINT *)&ir, 2);
+	int gap = 2 * GetSystemMetrics(SM_CXEDGE);
+	SendMessageW(pt->tip, TTM_TRACKPOSITION, 0, MAKELPARAM(lr.right + gap, ir.top));
+	SendMessageW(pt->tip, TTM_TRACKACTIVATE, TRUE, (LPARAM)&ti);
+	pt->shown = item;
+
+	// Only now does it have the size of this text. If the monitor has no room for it on the
+	// right, move it to the left of the list, and failing that under the list.
+	GetWindowRect(pt->tip, &tr);
+	int         width = tr.right - tr.left;
+	MONITORINFO mi    = {sizeof(mi)};
+	GetMonitorInfoW(MonitorFromWindow(list, MONITOR_DEFAULTTONEAREST), &mi);
+	if (lr.right + gap + width > mi.rcWork.right) {
+		int x = lr.left - gap - width, y = ir.top;
+		if (x < mi.rcWork.left) {
+			x = lr.left;
+			y = lr.bottom + gap;
+		}
+		SendMessageW(pt->tip, TTM_TRACKPOSITION, 0, MAKELPARAM(x, y));
+	}
+}
+
+static LRESULT CALLBACK PresetListProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR ref) {
+	auto *pt = (PresetTips *)ref;
+	switch (m) {
+	case WM_MOUSEMOVE: {
+		// Windows also sends this when a window appears or goes under a mouse that has not
+		// moved, the tooltip included. Only a real move may take over from the arrow keys.
+		POINT p{(short)LOWORD(l), (short)HIWORD(l)}, at = p;
+		ClientToScreen(h, &at);
+		if (at.x == pt->lastMouse.x && at.y == pt->lastMouse.y)
+			break;
+		pt->lastMouse = at;
+
+		// The open list holds the mouse capture, so moves outside it arrive here as well. And
+		// LB_ITEMFROMPOINT answers with the nearest item, so check the point is really on it.
+		RECT rc;
+		GetClientRect(h, &rc);
+		int item = -1;
+		if (PtInRect(&rc, p)) {
+			int hit = LOWORD(SendMessageW(h, LB_ITEMFROMPOINT, 0, l));
+			if (SendMessageW(h, LB_GETITEMRECT, hit, (LPARAM)&rc) != LB_ERR && PtInRect(&rc, p))
+				item = hit;
+		}
+		showPresetTip(h, pt, item);
+		break;
+	}
+	case WM_MOUSEWHEEL:
+	case WM_VSCROLL:
+		hidePresetTip(h, pt); // the items move under the mouse; the next move picks it up again
+		break;
+	case WM_SHOWWINDOW:
+	case WM_WINDOWPOSCHANGED: {
+		// The dropdown opening or closing, by either route.
+		UINT flags = m == WM_WINDOWPOSCHANGED ? ((const WINDOWPOS *)l)->flags : (w ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
+		if (flags & SWP_HIDEWINDOW)
+			hidePresetTip(h, pt);
+		if (flags & SWP_SHOWWINDOW)
+			GetCursorPos(&pt->lastMouse); // a mouse that just sits where the list opens is not hovering
+		break;
+	}
+	case WM_NCDESTROY:
+		RemoveWindowSubclass(h, PresetListProc, id);
+		delete pt;
+		break;
+	}
+	return DefSubclassProc(h, m, w, l);
+}
+
+// Keyboard: while the dropdown is open, every arrow-key move comes as CBN_SELCHANGE.
+static void showPresetTipForSelection(HWND combo) {
+	COMBOBOXINFO cbi = {sizeof(cbi)};
+	DWORD_PTR    ref = 0;
+	if (!SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0) || !GetComboBoxInfo(combo, &cbi) || !cbi.hwndList ||
+	    !GetWindowSubclass(cbi.hwndList, PresetListProc, kPresetTipsSubclass, &ref))
+		return;
+	showPresetTip(cbi.hwndList, (PresetTips *)ref, (int)SendMessageW(combo, CB_GETCURSEL, 0, 0));
+}
+
+// `descs` holds one entry per dropdown position.
+static void addPresetTips(HWND d, HWND combo, std::vector<std::wstring> descs) {
+	if (std::all_of(descs.begin(), descs.end(), [](const std::wstring &s) { return s.empty(); }))
+		return; // this display describes none of its presets
+	COMBOBOXINFO cbi = {sizeof(cbi)};
+	if (!GetComboBoxInfo(combo, &cbi) || !cbi.hwndList)
+		return;
+	HWND tip = createWrappedTooltip(d);
+	if (!tip)
+		return;
+	TTTOOLINFOW ti = {sizeof(ti)};
+	ti.uFlags      = TTF_TRACK | TTF_ABSOLUTE; // shown and placed by showPresetTip
+	ti.hwnd        = cbi.hwndList;
+	ti.lpszText    = (LPWSTR)L"";
+	SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+
+	auto *pt = new PresetTips{tip, std::move(descs)};
+	if (!SetWindowSubclass(cbi.hwndList, PresetListProc, kPresetTipsSubclass, (DWORD_PTR)pt))
+		delete pt;
+}
+
 INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
-	UNREFERENCED_PARAMETER(lp);
 	switch (msg) {
 	case WM_INITDIALOG: {
 		CheckDlgButton(d, IDC_AUTO_BRIGHTNESS, g_settings.autoAdjustEnabled.load() ? BST_CHECKED : BST_UNCHECKED);
 		CheckDlgButton(d, IDC_AUTO_ROTATE, g_settings.autoRotateEnabled.load() ? BST_CHECKED : BST_UNCHECKED);
-		// Snapshot the active display's preset state once; the combo fill, the control
-		// disabling and the tooltips below all key off it.
+		// Snapshot the active display's preset state once; the combo fill and the tooltips
+		// below key off it. (What gets disabled is kept current by showBrightnessState.)
 		bool hdrOn = g_hdrActive.load();
 		std::wstring dispName;
 		std::vector<ColorPreset> presetsCopy;
@@ -694,10 +1121,6 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 				have           = true;
 			}
 		}
-		// Auto-brightness is unavailable while Windows owns brightness (HDR) and while a
-		// reference-mode preset fixes it (macOS locks it there too).
-		if (hdrOn || lockBrightness)
-			EnableWindow(GetDlgItem(d, IDC_AUTO_BRIGHTNESS), FALSE);
 		CheckDlgButton(d, IDC_SHOW_OSD, g_settings.showOSD ? BST_CHECKED : BST_UNCHECKED);
 		CheckDlgButton(d, IDC_RUN_AT_STARTUP, g_settings.runAtStartup ? BST_CHECKED : BST_UNCHECKED);
 		CheckDlgButton(d, IDC_ENABLE_HOTKEYS, g_settings.enableCustomHotkeys ? BST_CHECKED : BST_UNCHECKED);
@@ -707,6 +1130,20 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 		setDlgHotkey(d, IDC_HOTKEY_DOWN, g_settings.hkDown);
 		SendDlgItemMessageW(d, IDC_BRIGHTNESS_STEPS_SPIN, UDM_SETRANGE32, kMinBrightnessSteps, kMaxBrightnessSteps);
 		SendDlgItemMessageW(d, IDC_BRIGHTNESS_STEPS_SPIN, UDM_SETPOS32, 0, g_settings.brightnessSteps);
+		addStepsHelp(d);
+		initRampField(d, IDC_RAMP_BRIGHTEN, IDC_RAMP_BRIGHTEN_SPIN, g_settings.rampBrightenMs.load());
+		initRampField(d, IDC_RAMP_DIM, IDC_RAMP_DIM_SPIN, g_settings.rampDimMs.load());
+
+		// The brightness slider: the control Boot Camp Control Panel uses, 0 to 100, with Dim and
+		// Bright at its sides. Boot Camp's has a tick mark at each end; here the only tick is the
+		// one for the level that was set (see drawSliderTick).
+		SendDlgItemMessageW(d, IDC_BRIGHTNESS_SLIDER, TBM_SETRANGEMIN, FALSE, 0);
+		SendDlgItemMessageW(d, IDC_BRIGHTNESS_SLIDER, TBM_SETRANGEMAX, FALSE, 100);
+		s_percentTyped = false;
+		SendDlgItemMessageW(d, IDC_SLIDER_PERCENT, EM_SETLIMITTEXT, 3, 0);
+		SendDlgItemMessageW(d, IDC_SLIDER_PERCENT_SPIN, UDM_SETRANGE32, 0, 100);
+		showBrightnessState(d, readSliderState(), true);
+		SetTimer(d, ID_OPTIONS_TIMER, 200, nullptr);
 
 		// Color preset combo for the active display. Under HDR only the main "Apple XDR Display"
 		// presets stay listed (the only ones compatible with HDR): switching between those is
@@ -725,15 +1162,19 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 			HWND combo = GetDlgItem(d, IDC_PRESET_COMBO);
 			SendMessageW(combo, CB_RESETCONTENT, 0, 0);
 			if (have && !shown.empty()) {
-				int sel = -1;
+				int                       sel = -1;
+				std::vector<std::wstring> descs(shown.size()); // by dropdown position, for the tooltips
 				for (size_t i = 0; i < shown.size(); ++i) {
 					int pos = (int)SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)shown[i].name.c_str());
 					SendMessageW(combo, CB_SETITEMDATA, pos, (LPARAM)shown[i].index);
 					if ((int)shown[i].index == active)
 						sel = pos;
+					if (pos >= 0 && pos < (int)descs.size())
+						descs[pos] = shown[i].desc;
 				}
 				SendMessageW(combo, CB_SETCURSEL, sel, 0); // -1 = no selection (active preset filtered out)
 				EnableWindow(combo, TRUE);
+				addPresetTips(d, combo, std::move(descs));
 			} else {
 				SendMessageW(combo, CB_ADDSTRING, 0, (LPARAM)L"(no presets)");
 				SendMessageW(combo, CB_SETCURSEL, 0, 0);
@@ -752,7 +1193,7 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 				HWND tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASS, nullptr, WS_POPUP | TTS_ALWAYSTIP,
 				                           0, 0, 0, 0, d, nullptr, g_hInst, nullptr);
 				if (tip) {
-					std::vector<int> targets{ IDC_AUTO_BRIGHTNESS };
+					std::vector<int> targets{ IDC_AUTO_BRIGHTNESS, IDC_BRIGHTNESS_SLIDER };
 					if (!IsWindowEnabled(combo))
 						targets.push_back(IDC_PRESET_COMBO);
 					for (int ctrlId : targets) {
@@ -772,9 +1213,71 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 		}
 		return TRUE;
 	}
+	case WM_NOTIFY: {
+		const NMHDR *nm = (const NMHDR *)lp;
+		if (nm->idFrom != IDC_BRIGHTNESS_SLIDER || nm->code != NM_CUSTOMDRAW)
+			break;
+		SetWindowLongPtrW(d, DWLP_MSGRESULT, drawSliderTick((const NMCUSTOMDRAW *)lp));
+		return TRUE;
+	}
+	case WM_HSCROLL: {
+		HWND slider = GetDlgItem(d, IDC_BRIGHTNESS_SLIDER);
+		if ((HWND)lp != slider)
+			break;
+		applyOptionsPercent(d, (int)SendMessageW(slider, TBM_GETPOS, 0, 0)); // as the thumb moves
+		return TRUE;
+	}
+	case WM_VSCROLL:
+		// The arrows of the percent field: no need to wait for a pause as with typing.
+		if ((HWND)lp != GetDlgItem(d, IDC_SLIDER_PERCENT_SPIN))
+			break;
+		commitPercentField(d, false);
+		return TRUE;
+	case WM_TIMER: {
+		if (wp == ID_TYPING_TIMER) {
+			commitPercentField(d, false);
+			return TRUE;
+		}
+		if (wp != ID_OPTIONS_TIMER)
+			break;
+		SliderState st;
+		if (tryReadSliderState(st))
+			showBrightnessState(d, st, false);
+		return TRUE;
+	}
+	case WM_SETCURSOR: {
+		// The steps label has a tooltip: say so with the help cursor.
+		if ((HWND)wp != GetDlgItem(d, IDC_STEPS_LABEL))
+			break;
+		SetCursor(LoadCursorW(nullptr, IDC_HELP));
+		SetWindowLongPtrW(d, DWLP_MSGRESULT, TRUE);
+		return TRUE;
+	}
+	case WM_DESTROY:
+		KillTimer(d, ID_OPTIONS_TIMER);
+		KillTimer(d, ID_TYPING_TIMER);
+		break;
 	case WM_COMMAND: {
 		WORD id   = LOWORD(wp);
 		WORD code = HIWORD(wp);
+		if (id == IDC_AUTO_BRIGHTNESS && code == BN_CLICKED) {
+			showBrightnessState(d, readSliderState(), false); // ramp fields, status line, tick mark
+			return TRUE;
+		}
+		if (id == IDC_PRESET_COMBO && code == CBN_SELCHANGE) {
+			showPresetTipForSelection((HWND)lp);
+			return TRUE;
+		}
+		if (id == IDC_SLIDER_PERCENT && code == EN_CHANGE && !s_fillingPercent) {
+			// Wait for a pause before applying: "50" should not flash through 5 % on the way.
+			s_percentTyped = true;
+			SetTimer(d, ID_TYPING_TIMER, 600, nullptr);
+			return TRUE;
+		}
+		if (id == IDC_SLIDER_PERCENT && code == EN_KILLFOCUS) {
+			commitPercentField(d, true);
+			return TRUE;
+		}
 		if (id == IDC_ENABLE_HOTKEYS && code == BN_CLICKED) {
 			BOOL en = IsDlgButtonChecked(d, IDC_ENABLE_HOTKEYS) == BST_CHECKED;
 			EnableWindow(GetDlgItem(d, IDC_HOTKEY_UP), en);
@@ -801,9 +1304,12 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 			SendDlgItemMessageW(d, IDC_HOTKEY_UP, HKM_SETHOTKEY, 0, 0);
 			SendDlgItemMessageW(d, IDC_HOTKEY_DOWN, HKM_SETHOTKEY, 0, 0);
 			SendDlgItemMessageW(d, IDC_BRIGHTNESS_STEPS_SPIN, UDM_SETPOS32, 0, kDefaultBrightnessSteps);
+			SendDlgItemMessageW(d, IDC_RAMP_BRIGHTEN_SPIN, UDM_SETPOS32, 0, kDefaultRampBrightenMs);
+			SendDlgItemMessageW(d, IDC_RAMP_DIM_SPIN, UDM_SETPOS32, 0, kDefaultRampDimMs);
 			return TRUE;
 		}
 		if (id == IDOK) {
+			commitPercentField(d, true); // Enter right after typing a level
 			g_settings.autoAdjustEnabled.store(IsDlgButtonChecked(d, IDC_AUTO_BRIGHTNESS) == BST_CHECKED);
 			g_settings.autoRotateEnabled.store(IsDlgButtonChecked(d, IDC_AUTO_ROTATE) == BST_CHECKED);
 			g_settings.showOSD            = (IsDlgButtonChecked(d, IDC_SHOW_OSD) == BST_CHECKED);
@@ -821,6 +1327,8 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 
 			ULONG steps            = (ULONG)SendDlgItemMessageW(d, IDC_BRIGHTNESS_STEPS_SPIN, UDM_GETPOS32, 0, 0);
 			g_settings.brightnessSteps = std::clamp(steps, kMinBrightnessSteps, kMaxBrightnessSteps);
+			g_settings.rampBrightenMs.store(readRampField(d, IDC_RAMP_BRIGHTEN, g_settings.rampBrightenMs.load()));
+			g_settings.rampDimMs.store(readRampField(d, IDC_RAMP_DIM, g_settings.rampDimMs.load()));
 			g_settings.Save();
 			g_settings.SetStartup(g_settings.runAtStartup);
 			orient_set_enabled(g_settings.autoRotateEnabled.load());
@@ -1011,35 +1519,19 @@ LRESULT CALLBACK HiddenWndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
 	}
 	if (m == WMAPP_NOTIFYCALLBACK) {
 		if (LOWORD(lParam) == WM_LBUTTONUP) {
-			if (g_hdrActive.load()) {
+			SliderState st = readSliderState();
+			if (st.hdr) {
 				TrayPopup::Show(h, 0, nullptr, true, L"Brightness controlled by Windows (HDR)");
 				return 0;
 			}
-			int   pct    = 50;
-			ULONG refMin = 1000;
-			ULONG refMax = 60000;
-			bool  locked = false;
-			{
-				std::lock_guard<std::mutex> lock(g_displayMutex);
-				if (g_displays.empty()) return 0;
-				ULONG idx = std::min((ULONG)(g_displays.size() - 1), g_settings.activeDisplayIndex);
-				auto &ref = g_displays[idx];
-				locked = ref.activePresetLocksBrightness();
-				int range = ref.maxBrightness - ref.minBrightness;
-				if (range <= 0) range = 1;
-				pct    = (int)((float)(ref.currentBrightness - ref.minBrightness) / (float)range * 100.0f);
-				refMin = ref.minBrightness;
-				refMax = ref.maxBrightness;
-			}
-			if (locked) { // reference-mode preset: brightness is fixed (macOS locks it there too)
+			if (!st.hasDisplay) return 0;
+			if (st.locked) { // reference-mode preset: brightness is fixed (macOS locks it there too)
 				TrayPopup::Show(h, 0, nullptr, true, L"Brightness fixed by the color preset");
 				return 0;
 			}
 
-			TrayPopup::Show(h, pct, [refMin, refMax](int newPct) {
-				ULONG r   = refMax - refMin;
-				ULONG val = refMin + (ULONG)((float)r * (float)newPct / 100.0f);
-				ApplyBrightness(val, true, false);
+			TrayPopup::Show(h, st.percent(), [refMin = st.minBrightness, refMax = st.maxBrightness](int newPct) {
+				applySliderPercent(newPct, refMin, refMax);
 			});
 			return 0;
 		}
@@ -1343,10 +1835,13 @@ void startWorker() {
 					if (retarget) {
 						ULONG goal = mapLuxToBrightness(lux, dev);
 						if (goal != dev.rampGoal || dev.rampDurationMs == 0.0) {
+							ULONG rampMs = (goal >= dev.currentBrightness) ? g_settings.rampBrightenMs.load()
+							                                               : g_settings.rampDimMs.load();
 							dev.rampStart      = dev.currentBrightness;
 							dev.rampGoal       = goal;
 							dev.rampStartMs    = nowMs();
-							dev.rampDurationMs = (goal >= dev.currentBrightness) ? kRampBrightenMs : kRampDimMs;
+							// At least 1 ms: 0 means "no ramp running" here, and the goal would never be applied.
+							dev.rampDurationMs = std::max(1.0, (double)rampMs);
 						}
 						dev.lastTargetLux = lux;
 					}

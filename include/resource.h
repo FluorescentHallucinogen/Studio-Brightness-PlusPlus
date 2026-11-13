@@ -31,11 +31,25 @@
 #define IDC_RESET_SHORTCUTS       1201
 #define IDC_BRIGHTNESS_STEPS      1301
 #define IDC_BRIGHTNESS_STEPS_SPIN 1302
+#define IDC_RAMP_BRIGHTEN         1303
+#define IDC_RAMP_BRIGHTEN_SPIN    1304
+#define IDC_RAMP_DIM              1305
+#define IDC_RAMP_DIM_SPIN         1306
+#define IDC_STEPS_LABEL           1307
+#define IDC_AUTO_STATUS           1308
 
 // Color preset (Options Dialog)
 #define IDC_PRESET_DISPLAY_LABEL  1401
 #define IDC_PRESET_COMBO          1402
 #define IDC_HDR_OFF_BTN           1403
+
+// Brightness slider (Options Dialog)
+#define IDC_BRIGHTNESS_SLIDER     1501
+#define IDC_SLIDER_DIM_LABEL      1502
+#define IDC_SLIDER_BRIGHT_LABEL   1503
+#define IDC_SLIDER_PERCENT        1504
+#define IDC_SLIDER_PERCENT_SPIN   1505
+#define IDC_SLIDER_PERCENT_UNIT   1506
 
 // Hotkey IDs
 #define ID_HOTKEY_UP   4001

@@ -2,6 +2,11 @@
 #include "resource.h"
 #include "version.h"
 
+// Trackbar style that older resource headers stop short of.
+#ifndef TBS_DOWNISLEFT
+#define TBS_DOWNISLEFT 0x0400
+#endif
+
 IDI_MYICON ICON "studio-brightness-plusplus.ico"
 
 VS_VERSION_INFO VERSIONINFO
@@ -33,35 +38,67 @@ BEGIN
     END
 END
 
-IDD_OPTIONS DIALOGEX 0, 0, 260, 290
+IDD_OPTIONS DIALOGEX 0, 0, 280, 362
 STYLE DS_SETFONT | DS_MODALFRAME | DS_FIXEDSYS | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Options"
 FONT 9, "Segoe UI"
 BEGIN
-    CONTROL "Enable automatic brightness", IDC_AUTO_BRIGHTNESS, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 8, 180, 12
+    CONTROL "Run at Windows startup",      IDC_RUN_AT_STARTUP,  "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 8, 180, 12
     CONTROL "Enable automatic rotate",      IDC_AUTO_ROTATE,     "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 24, 180, 12
-    CONTROL "Run at Windows startup",      IDC_RUN_AT_STARTUP,  "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 40, 180, 12
-    CONTROL "Show On-Screen Display",      IDC_SHOW_OSD,        "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 56, 180, 12
-    CONTROL "Enable custom shortcuts",     IDC_ENABLE_HOTKEYS,  "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 72, 180, 12
 
-    GROUPBOX "Color preset", -1, 6, 88, 248, 58
-    LTEXT    "", IDC_PRESET_DISPLAY_LABEL, 14, 100, 234, 9
-    COMBOBOX IDC_PRESET_COMBO, 14, 111, 234, 120, CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
-    PUSHBUTTON "Turn off HDR", IDC_HDR_OFF_BTN, 14, 128, 70, 12, NOT WS_VISIBLE
+    GROUPBOX "Color preset", -1, 6, 40, 268, 58
+    LTEXT    "", IDC_PRESET_DISPLAY_LABEL, 14, 52, 254, 9
+    COMBOBOX IDC_PRESET_COMBO, 14, 63, 254, 120, CBS_DROPDOWNLIST | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON "Turn off HDR", IDC_HDR_OFF_BTN, 14, 80, 70, 12, NOT WS_VISIBLE
 
-    GROUPBOX "Shortcuts", -1, 6, 152, 248, 72
+    // Brightness. Kept right under the color preset: a preset (or HDR) can lock these.
+    // The slider is the control Boot Camp Control Panel uses (range and tick are set in OptionsDlgProc),
+    // with a percent field kept in step with it for typing an exact level.
+    LTEXT   "Dim",    IDC_SLIDER_DIM_LABEL,    8, 106, 16, 9
+    CONTROL "", IDC_BRIGHTNESS_SLIDER, "msctls_trackbar32", TBS_DOWNISLEFT | WS_TABSTOP, 26, 104, 172, 18
+    LTEXT   "Bright", IDC_SLIDER_BRIGHT_LABEL, 201, 106, 24, 9
+    EDITTEXT IDC_SLIDER_PERCENT, 228, 103, 32, 14, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
+    CONTROL  "", IDC_SLIDER_PERCENT_SPIN, "msctls_updown32", UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_AUTOBUDDY, 249, 103, 11, 14
+    LTEXT   "%", IDC_SLIDER_PERCENT_UNIT, 263, 106, 9, 9
 
-    LTEXT   "Increase:", -1, 14, 168, 44, 10
-    CONTROL "", IDC_HOTKEY_UP,   "msctls_hotkey32", WS_TABSTOP | WS_BORDER, 70, 166, 168, 14
+    CONTROL "Enable automatic brightness", IDC_AUTO_BRIGHTNESS, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 128, 180, 12
 
-    LTEXT   "Decrease:", -1, 14, 188, 44, 10
-    CONTROL "", IDC_HOTKEY_DOWN, "msctls_hotkey32", WS_TABSTOP | WS_BORDER, 70, 186, 168, 14
+    // What automatic brightness is working from; filled in by OptionsDlgProc while it is on. One line,
+    // starting where the group titles start. The dialog's width is set by this line at its longest.
+    LTEXT   "", IDC_AUTO_STATUS, 11, 142, 261, 9, SS_NOPREFIX
 
-    LTEXT   "Brightness steps (10-50):", -1, 8, 234, 90, 10
-    EDITTEXT IDC_BRIGHTNESS_STEPS, 100, 232, 32, 14, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
-    CONTROL  "", IDC_BRIGHTNESS_STEPS_SPIN, "msctls_updown32", UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_AUTOBUDDY, 120, 232, 11, 14
+    // Ramp times of automatic brightness changes; disabled while automatic brightness is off.
+    LTEXT   "Automatic brightening time (0-60000):", -1, 8, 158, 128, 10
+    EDITTEXT IDC_RAMP_BRIGHTEN, 138, 156, 40, 14, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
+    CONTROL  "", IDC_RAMP_BRIGHTEN_SPIN, "msctls_updown32", UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_AUTOBUDDY | UDS_NOTHOUSANDS, 167, 156, 11, 14
+    LTEXT   "ms", -1, 182, 158, 20, 10
 
-    PUSHBUTTON     "Reset to Defaults", IDC_RESET_SHORTCUTS, 8, 256, 100, 14
-    DEFPUSHBUTTON  "Save",              IDOK,                148, 256, 48, 14
-    PUSHBUTTON     "Cancel",            IDCANCEL,            202, 256, 48, 14
+    LTEXT   "Automatic dimming time (0-60000):", -1, 8, 176, 128, 10
+    EDITTEXT IDC_RAMP_DIM, 138, 174, 40, 14, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
+    CONTROL  "", IDC_RAMP_DIM_SPIN, "msctls_updown32", UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_AUTOBUDDY | UDS_NOTHOUSANDS, 167, 174, 11, 14
+    LTEXT   "ms", -1, 182, 176, 20, 10
+
+    // Brightness shortcuts. These two apply to the keyboard's own brightness keys as well as to the
+    // custom shortcuts, so they sit above the checkbox that only switches the custom ones.
+    // Hovering the steps label shows an explanatory tooltip.
+    LTEXT   "Steps for native and custom brightness shortcuts (10-50):", IDC_STEPS_LABEL, 8, 198, 184, 10, SS_NOTIFY
+    EDITTEXT IDC_BRIGHTNESS_STEPS, 196, 196, 40, 14, ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP
+    CONTROL  "", IDC_BRIGHTNESS_STEPS_SPIN, "msctls_updown32", UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_AUTOBUDDY, 225, 196, 11, 14
+
+    CONTROL "Show brightness level on screen when using native and custom shortcuts", IDC_SHOW_OSD, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 216, 264, 12
+
+    // Kept right above the group it switches on and off.
+    CONTROL "Enable custom brightness shortcuts", IDC_ENABLE_HOTKEYS, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 232, 180, 12
+
+    GROUPBOX "Custom shortcuts", -1, 6, 246, 268, 72
+
+    LTEXT   "Increase:", -1, 14, 262, 44, 10
+    CONTROL "", IDC_HOTKEY_UP,   "msctls_hotkey32", WS_TABSTOP | WS_BORDER, 70, 260, 188, 14
+
+    LTEXT   "Decrease:", -1, 14, 282, 44, 10
+    CONTROL "", IDC_HOTKEY_DOWN, "msctls_hotkey32", WS_TABSTOP | WS_BORDER, 70, 280, 188, 14
+
+    PUSHBUTTON     "Reset to Defaults", IDC_RESET_SHORTCUTS, 8, 328, 100, 14
+    DEFPUSHBUTTON  "Save",              IDOK,                168, 328, 48, 14
+    PUSHBUTTON     "Cancel",            IDCANCEL,            222, 328, 48, 14
 END
