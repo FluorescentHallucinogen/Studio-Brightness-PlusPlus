@@ -493,7 +493,9 @@ static void cleanupAlsSensors() {
 // If the display has an ALS (matched by ContainerId), use it.
 // Otherwise use the master sensor: another Apple display's, then any sensor Windows has.
 // With no sensor reporting, it is the last reading there was.
-static Ambient getAmbient(const DisplayDevice &dev) {
+// The display is given by its ContainerId. All zeros stands for no display at all: there is no
+// sensor of its own to look for then, and the rest is the same.
+static Ambient getAmbient(const GUID &container) {
 	std::lock_guard<std::mutex> lock(g_alsMutex);
 	Ambient a;
 	auto luxOnly = [&a](float lux) { // a sensor read through Windows: no color
@@ -507,16 +509,16 @@ static Ambient getAmbient(const DisplayDevice &dev) {
 		return a;
 	};
 	static const GUID zero  = {};
-	const bool        known = memcmp(&dev.containerId, &zero, sizeof(GUID)) != 0;
+	const bool        known = memcmp(&container, &zero, sizeof(GUID)) != 0;
 
 	// Prefer the raw-HID Apple ALS (the same source Boot Camp uses) matched to this display.
-	if (known && als_get_ambient(&dev.containerId, &a.reading))
+	if (known && als_get_ambient(&container, &a.reading))
 		return from(AmbientSource::Native);
 
 	// Try to find a sensor matching this display's ContainerId
 	if (known) {
 		for (auto *l : g_alsListeners) {
-			if (memcmp(&l->containerId, &dev.containerId, sizeof(GUID)) == 0 && l->alive()) {
+			if (memcmp(&l->containerId, &container, sizeof(GUID)) == 0 && l->alive()) {
 				luxOnly(l->lux());
 				return from(AmbientSource::Native);
 			}
@@ -547,7 +549,7 @@ static Ambient getAmbient(const DisplayDevice &dev) {
 
 // Just the lux of it, which is all automatic brightness goes by.
 static float getAmbientLux(const DisplayDevice &dev) {
-	return getAmbient(dev).reading.lux;
+	return getAmbient(dev.containerId).reading.lux;
 }
 
 /* ---------- mapping lux to brightness ---------- */
@@ -729,7 +731,9 @@ static SliderState sliderStateLocked() {
 		st.brightness    = ref.currentBrightness;
 		st.baseBrightness = ref.baseBrightness;
 		st.baseLux        = ref.baseLux;
-		st.ambient        = getAmbient(ref);
+		st.ambient        = getAmbient(ref.containerId);
+	} else {
+		st.ambient = getAmbient(GUID{}); // no display to ask for: whatever other sensor there is
 	}
 	return st;
 }
@@ -1006,6 +1010,7 @@ struct OptionsState {
 	int  scroll     = 0;     // how far it is scrolled
 	RECT view       = {};    // the part of the dialog it shows through, as last laid out
 	int  wheel      = 0;     // mouse wheel movement not yet turned into scrolling
+	bool wheelKept  = false; // a control is using the wheel itself (see PageCtrlProc)
 	bool rescaling  = false; // between WM_DPICHANGED and the layout that follows it
 };
 static OptionsState *optionsState(HWND d) {
@@ -1061,10 +1066,10 @@ static std::wstring ambientText(const Ambient &a) {
 	return text;
 }
 
-// Without a display there is no "its own sensor" to start from, so the line is blank and grey then.
+// Without a display the line is there all the same: a sensor does not have to be a display's,
+// and with none at all it says that there is no reading.
 static void showAmbient(HWND d, const SliderState &st) {
-	enableDlgItem(d, IDC_AMBIENT_LABEL, st.hasDisplay);
-	showText(d, IDC_AMBIENT_VALUE, st.hasDisplay ? ambientText(st.ambient) : std::wstring());
+	showText(d, IDC_AMBIENT_VALUE, ambientText(st.ambient));
 }
 
 static void showAutoStatus(HWND d, const SliderState &st) {
@@ -1745,14 +1750,25 @@ static LRESULT CALLBACK PageCtrlProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PT
 	HWND d = GetParent(h);
 	switch (m) {
 	case WM_MOUSEWHEEL: {
-		// While the dialog scrolls, the wheel scrolls it wherever the mouse or the keyboard is.
-		// A list or a slider that changed under a wheel meant for the dialog would be a nasty
-		// surprise: both act at once here. An open list is another window and keeps its wheel.
-		const OptionsState *os   = optionsState(d);
-		bool                open = isClass(h, WC_COMBOBOXW) && SendMessageW(h, CB_GETDROPPEDSTATE, 0, 0);
-		if (os && os->content > os->view.bottom && !open)
-			return SendMessageW(d, WM_MOUSEWHEEL, w, l);
-		break;
+		// While the dialog scrolls, the wheel scrolls it from a control that has no use for the
+		// wheel. An open list is another window and keeps its wheel. A closed list gives it to
+		// the dialog: picking a display acts at once, and a wheel meant for the dialog should not
+		// do that on the way.
+		OptionsState *os   = optionsState(d);
+		bool          open = isClass(h, WC_COMBOBOXW) && SendMessageW(h, CB_GETDROPPEDSTATE, 0, 0);
+		if (!os || os->content <= os->view.bottom || open)
+			break;
+		if (isClass(h, TRACKBAR_CLASSW) || isClass(h, WC_EDITW) || isClass(h, UPDOWN_CLASSW)) {
+			// The slider and the number fields, with their arrows, do have a use for the wheel,
+			// and keep it: it works on them as it does while nothing scrolls. Whatever such a
+			// control leaves of the message goes up to its parent, and the dialog must not
+			// scroll on top of what the control has done with it.
+			os->wheelKept = true;
+			LRESULT res   = DefSubclassProc(h, m, w, l);
+			os->wheelKept = false;
+			return res;
+		}
+		return SendMessageW(d, WM_MOUSEWHEEL, w, l);
 	}
 	case WM_SETFOCUS:
 		PostMessageW(d, WMAPP_OPTIONS_SHOW, (WPARAM)h, 0); // the keyboard has got here: have it in view
@@ -1915,7 +1931,7 @@ static void setPresetTips(HWND d, HWND combo, std::vector<std::wstring> descs) {
 static void fillDisplayControls(HWND d, const DisplaysView &v) {
 	bool have = v.active >= 0;
 
-	// The displays, in the order of the tray menu. Whether there is one to pick is up to
+	// The displays, in the order of the tray menu. Whether the list can be used is up to
 	// showDisplayChoice.
 	HWND displays = GetDlgItem(d, IDC_DISPLAY_COMBO);
 	SendMessageW(displays, CB_RESETCONTENT, 0, 0);
@@ -1977,14 +1993,14 @@ static void fillDisplayControls(HWND d, const DisplaysView &v) {
 	setWhy(d, IDC_PRESET_COMBO, v.hdr && have && shown.empty() ? L"Unavailable while HDR is on" : nullptr);
 }
 
-// The display list and "Sync manual brightness across displays". With one display, or none,
-// there is nothing to pick and nothing to keep in sync, so both are disabled then. The tray
-// menu has the same switch and can turn it while the dialog is open.
+// The display list and "Sync manual brightness across displays". The list is disabled only
+// when it has no display in it: one display is still something to open the list and see. The
+// checkbox takes two displays, as with one there is nothing to keep in sync. The tray menu has
+// the same switch and can turn it while the dialog is open.
 static void showDisplayChoice(HWND d, const OptionsState &os) {
-	bool several = os.shown.names.size() > 1;
 	checkDlgItem(d, IDC_LINK_DISPLAYS, g_settings.linkedMode);
-	enableDlgItem(d, IDC_DISPLAY_COMBO, several);
-	enableDlgItem(d, IDC_LINK_DISPLAYS, several);
+	enableDlgItem(d, IDC_DISPLAY_COMBO, !os.shown.names.empty());
+	enableDlgItem(d, IDC_LINK_DISPLAYS, os.shown.names.size() > 1);
 }
 
 // Bring the dialog in line with the displays: first the lists that follow from which displays
@@ -2139,6 +2155,8 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 		OptionsState *os = optionsState(d);
 		if (!os || os->content <= os->view.bottom)
 			break; // nothing to scroll
+		if (os->wheelKept)
+			return TRUE; // passed up by a control that works with the wheel itself
 		UINT lines = 3;
 		SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
 		int notch = lines == WHEEL_PAGESCROLL ? (int)os->view.bottom : (int)lines * dialogUnitsY(d, 10);
