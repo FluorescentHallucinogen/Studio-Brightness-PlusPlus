@@ -37,9 +37,15 @@
 #define IDC_RAMP_DIM_SPIN         1306
 #define IDC_STEPS_LABEL           1307
 #define IDC_AUTO_STATUS           1308
+#define IDC_BRIGHTEN_LIMIT        1309
+#define IDC_BRIGHTEN_LIMIT_SPIN   1310
+#define IDC_BRIGHTEN_LIMIT_LABEL  1311
+#define IDC_DIM_LIMIT             1312
+#define IDC_DIM_LIMIT_SPIN        1313
+#define IDC_DIM_LIMIT_LABEL       1314
 
 // Color preset (Options Dialog)
-#define IDC_PRESET_DISPLAY_LABEL  1401
+#define IDC_PRESET_NOTE           1401
 #define IDC_PRESET_COMBO          1402
 #define IDC_HDR_OFF_BTN           1403
 
@@ -50,6 +56,10 @@
 #define IDC_SLIDER_PERCENT        1504
 #define IDC_SLIDER_PERCENT_SPIN   1505
 #define IDC_SLIDER_PERCENT_UNIT   1506
+
+// Displays (Options Dialog)
+#define IDC_DISPLAY_COMBO         1601
+#define IDC_LINK_DISPLAYS         1602
 
 // Hotkey IDs
 #define ID_HOTKEY_UP   4001

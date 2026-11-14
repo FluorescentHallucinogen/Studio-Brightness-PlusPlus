@@ -109,18 +109,21 @@ To remove it, use Windows Settings, Apps, "Installed apps", which also clears yo
 - **Increase brightness:** Use your keyboard's native brightness up key (sun/F2) or a custom shortcut (if enabled in Options).
 - **Decrease brightness:** Use your keyboard's native brightness down key (sun/F1) or a custom shortcut (if enabled).
 - **Quick slider:** Left-click the tray icon to open the brightness slider popup.
-- **Automatic brightness:** If you have a compatible ambient light sensor, the app auto-adjusts brightness. Right-click the tray icon to toggle "Automatic Brightness".
-- **Automatic rotation:** With the sensor driver installed, the display follows when you physically rotate it. Right-click the tray icon to toggle "Automatic Rotate".
+- **Automatic brightness:** If you have a compatible ambient light sensor, the app auto-adjusts brightness. Right-click the tray icon to toggle "Automatic brightness".
+- **Automatic rotation:** With the sensor driver installed, the display follows when you physically rotate it. Right-click the tray icon to toggle "Automatic rotate".
 - **Options...:** Right-click the tray icon > "Options...". You can:
   - Enable "Run at Windows startup"
   - Toggle automatic rotation
-  - Choose a color preset (Apple Reference Mode) for the active display; hovering a preset in the open list, or moving to it with the arrow keys, shows the description the display provides for it
+  - With two or more displays: pick the display that the color preset and the brightness slider below belong to. It takes effect at once, as in the tray menu
+  - Choose a color preset (Apple Reference Mode) for that display; hovering a preset in the open list, or moving to it with the arrow keys, shows the description the display provides for it
+  - With two or more displays: tick "Sync manual brightness across displays" to have a brightness change made by hand go to every display, matched in nits. It is also in the tray menu, and takes effect at once
   - Adjust brightness with the Dim/Bright slider, applied as you drag, or type an exact level in percent next to it
-  - Toggle automatic brightness. While it is on, a line under the checkbox shows the level you set and the ambient light it was set in, next to the level and the ambient light now, and a tick mark on the slider marks the level you set
+  - Toggle automatic brightness; like the slider, it takes effect at once. While it is on, a line under the checkbox shows the level you set and the ambient light it was set in, next to the level and the ambient light now, and a tick mark on the slider marks the level you set
+  - Limit how far automatic brightness may go above and below the level you set (0-100 % of the slider each; 100, the default, means no limit). The slider highlights the range the limits leave and has a tick at each limit
   - Set how long an automatic brightness change takes, separately for brightening and for dimming (0-60000 ms)
   - Set the number of steps (10-50) for the native and custom brightness shortcuts: one press changes brightness by that fraction of the range, so fewer steps means a bigger change per press
   - Show or hide the brightness level on screen (the OSD) when using the native and custom shortcuts
-  - Enable custom brightness shortcuts and set their Increase/Decrease keys
+  - Enable custom brightness shortcuts and set the custom increase and decrease brightness shortcuts
   - Click "Reset to Defaults" to restore default settings
   - All settings are automatically saved to the Windows Registry
 - **Logs...:** Right-click the tray icon > "Logs..." to open the real-time log viewer. Useful for diagnostics and troubleshooting.
@@ -135,7 +138,7 @@ Unlocking the sensors takes a small null driver package, which tells Windows to 
 
 That community package is not bundled with or recommended by this app yet. Its current builds are signed with a self signed certificate that changes on every build, and the install script adds that certificate to the Windows trusted root store. The plan, once the package carries a license and a stable signing identity, is to install it from inside the app. Issue #16 tracks where this stands.
 
-Once a sensor driver is in place the app picks it up on its own: ambient light moves from the Sensor API to the display's sensor, and "Automatic Rotate" starts working. Rotation only ever reacts to a physical move of the panel; the app never changes your orientation at startup. Everything known about the interfaces is in `docs/hid-map.md`, and `tools/hidprobe` is the read-only diagnostic used to map them, attached to each release as `hid_probe.exe`.
+Once a sensor driver is in place the app picks it up on its own: ambient light moves from the Sensor API to the display's sensor, and "Automatic rotate" starts working. Rotation only ever reacts to a physical move of the panel; the app never changes your orientation at startup. Everything known about the interfaces is in `docs/hid-map.md`, and `tools/hidprobe` is the read-only diagnostic used to map them, attached to each release as `hid_probe.exe`.
 
 ## Building
 
@@ -170,11 +173,11 @@ The output is `bin\studio-brightness-plusplus-x.y.z.msi`. Releases are produced 
 ## Technical notes
 
 - **`hid.cpp`** uses profile-based detection with Apple VID/PID matching, excluding HID subcollections (`&col`). Unknown Apple displays fall back to generic mode if Feature caps are valid.
-- **Multi-display:** All detected displays share linked brightness. The worker thread manages device lifecycle with automatic reconnection.
+- **Multi-display:** By default all detected displays share linked brightness: a change made by hand goes to every display, matched in nits. "Sync manual brightness across displays", in the tray menu and in Options, turns that off, and manual changes then go to the display picked there. The worker thread manages device lifecycle with automatic reconnection.
 - **ALS:** Two sources. With a sensor driver installed, the display's ambient light collection is read directly as HID from a dedicated polling thread: illuminance, colour temperature and CIE chromaticity, with the HID unit exponents applied. Otherwise `ISensorEvents` async callbacks. Sensors are correlated to displays via `DEVPKEY_Device_ContainerId`, and the brightest of a display's sensors wins.
 - **Orientation:** The orientation sensor's tilt angle is polled on the same thread and mapped to a Windows display orientation, applied with `ChangeDisplaySettingsEx` only when the panel has actually moved.
 - The native and custom brightness shortcuts default to **10 steps** across the detected range (configurable 10-50). The sliders are not tied to these steps; they work in whole percent of the range.
-- ALS auto-adjust follows an Apple-style response: it reacts only to ambient changes above a relative threshold (20%), then ramps to the new target over an asymmetric duration (1.5s to brighten and 5s to dim by default, both adjustable in Options), stepping in perceptual (log2) space.
+- ALS auto-adjust follows an Apple-style response: it reacts only to ambient changes above a relative threshold (20%), then ramps to the new target over an asymmetric duration (1.5s to brighten and 5s to dim by default, both adjustable in Options), stepping in perceptual (log2) space. Two optional limits from Options keep the target within a given share of the range above and below the level set by hand.
 - Brightness key events are captured via HID RawInput (Consumer Control page). Custom global hotkeys use `RegisterHotKey`.
 - **OSD** is rendered via GDI+ as a layered (per-pixel alpha) window -- no focus theft, passes clicks through.
 - **Settings persistence:** All options stored in `HKEY_CURRENT_USER\Software\StudioBrightnessPlusPlus`. Run-at-startup uses `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run`.
