@@ -342,7 +342,20 @@ private:
 
 static std::vector<AlsSensorListener *> g_alsListeners;
 static std::mutex                       g_alsMutex;
-static std::atomic<float>               g_lastKnownLux{100.f}; // last good lux; survives ALS re-init
+// Where the ambient light reading used for a display comes from.
+enum class AmbientSource {
+	None,    // no sensor has reported since the app started
+	Native,  // the display's own sensor
+	Another, // the sensor of another Apple display, or any other ambient light sensor Windows has
+	Last,    // no sensor is reporting now: the last reading there was
+};
+struct Ambient {
+	AmbientReading reading; // color only from an Apple display's sensor, and not in the dark
+	AmbientSource  source = AmbientSource::None;
+	bool live() const { return source == AmbientSource::Native || source == AmbientSource::Another; }
+};
+static AmbientReading g_lastAmbient;             // last good reading; survives ALS re-init. Under g_alsMutex.
+static bool           g_haveLastAmbient = false; // false until a sensor has reported once
 
 // Extract ContainerId from a sensor device path by looking up its parent chain.
 // The sensor path typically contains the HID instance ID which shares a ContainerId
@@ -475,58 +488,65 @@ static void cleanupAlsSensors() {
 	g_alsListeners.clear();
 }
 
-// Get lux from the best available sensor for a given display.
+// Get the ambient light from the best available sensor for a given display, and say which it was.
 // If the display has an ALS (matched by ContainerId), use it.
-// Otherwise use the master sensor (index 0 or user-selected).
-// `live`, when given, says whether the value is a sensor's current reading or only the last
-// one that was known.
-static float getAmbientLux(const DisplayDevice &dev, bool *live = nullptr) {
+// Otherwise use the master sensor: another Apple display's, then any sensor Windows has.
+// With no sensor reporting, it is the last reading there was.
+static Ambient getAmbient(const DisplayDevice &dev) {
 	std::lock_guard<std::mutex> lock(g_alsMutex);
-	if (live) *live = true;
+	Ambient a;
+	auto luxOnly = [&a](float lux) { // a sensor read through Windows: no color
+		a.reading     = AmbientReading{};
+		a.reading.lux = lux;
+	};
+	auto from = [&a](AmbientSource source) {
+		a.source          = source;
+		g_lastAmbient     = a.reading;
+		g_haveLastAmbient = true;
+		return a;
+	};
+	static const GUID zero  = {};
+	const bool        known = memcmp(&dev.containerId, &zero, sizeof(GUID)) != 0;
 
 	// Prefer the raw-HID Apple ALS (the same source Boot Camp uses) matched to this display.
-	{
-		GUID zeroG = {};
-		float lx;
-		if (memcmp(&dev.containerId, &zeroG, sizeof(GUID)) != 0 && als_get_lux(&dev.containerId, &lx)) {
-			g_lastKnownLux.store(lx, std::memory_order_relaxed);
-			return lx;
-		}
-	}
+	if (known && als_get_ambient(&dev.containerId, &a.reading))
+		return from(AmbientSource::Native);
 
 	// Try to find a sensor matching this display's ContainerId
-	GUID zero = {};
-	if (memcmp(&dev.containerId, &zero, sizeof(GUID)) != 0) {
+	if (known) {
 		for (auto *l : g_alsListeners) {
 			if (memcmp(&l->containerId, &dev.containerId, sizeof(GUID)) == 0 && l->alive()) {
-				float lx = l->lux();
-				g_lastKnownLux.store(lx, std::memory_order_relaxed);
-				return lx;
+				luxOnly(l->lux());
+				return from(AmbientSource::Native);
 			}
 		}
 	}
 
 	// Raw-HID master (any display's ALS) before the Sensor-API master.
-	{
-		float lx;
-		if (als_get_lux(nullptr, &lx)) {
-			g_lastKnownLux.store(lx, std::memory_order_relaxed);
-			return lx;
-		}
-	}
+	if (als_get_ambient(nullptr, &a.reading))
+		return from(AmbientSource::Another);
 
 	// Fallback: use first alive sensor (master)
 	for (auto *l : g_alsListeners) {
 		if (l->alive()) {
-			float lx = l->lux();
-			g_lastKnownLux.store(lx, std::memory_order_relaxed);
-			return lx;
+			luxOnly(l->lux());
+			return from(AmbientSource::Another);
 		}
 	}
 
 	// No live sensor yet (e.g. just after an ALS re-init): use the last known value, not a hard default.
-	if (live) *live = false;
-	return g_lastKnownLux.load(std::memory_order_relaxed);
+	if (g_haveLastAmbient) {
+		a.reading = g_lastAmbient;
+		a.source  = AmbientSource::Last;
+	} else {
+		luxOnly(100.f); // nothing to go by yet
+	}
+	return a;
+}
+
+// Just the lux of it, which is all automatic brightness goes by.
+static float getAmbientLux(const DisplayDevice &dev) {
+	return getAmbient(dev).reading.lux;
 }
 
 /* ---------- mapping lux to brightness ---------- */
@@ -678,8 +698,7 @@ struct SliderState {
 	// it was set in, and the ambient light now.
 	ULONG baseBrightness = 0;
 	float baseLux        = 0.f;
-	float lux            = 0.f;
-	bool  luxLive        = false; // false: no sensor is reporting, `lux` is only the last known value
+	Ambient ambient; // the ambient light now, and where that reading comes from
 
 	bool usable() const { return hasDisplay && !hdr && !locked; }
 
@@ -709,7 +728,7 @@ static SliderState sliderStateLocked() {
 		st.brightness    = ref.currentBrightness;
 		st.baseBrightness = ref.baseBrightness;
 		st.baseLux        = ref.baseLux;
-		st.lux            = getAmbientLux(ref, &st.luxLive);
+		st.ambient        = getAmbient(ref);
 	}
 	return st;
 }
@@ -994,21 +1013,53 @@ static void showSliderMarks(HWND d, const SliderMarks &m) {
 	InvalidateRect(slider, nullptr, TRUE);
 }
 
+// For a line of text that is rewritten on a timer: rewriting the same text would only make it flicker.
+static void showText(HWND d, int ctrlId, const std::wstring &text) {
+	wchar_t shown[160] = {};
+	GetDlgItemTextW(d, ctrlId, shown, 160);
+	if (text != shown)
+		SetDlgItemTextW(d, ctrlId, text.c_str());
+}
+
+// The "Ambient light:" line: the reading automatic brightness goes by for the picked display, and
+// in brackets where it comes from, because a sensor that is not the display's own is somewhere
+// else and sees other light. Shown whether automatic brightness is on or not.
+static std::wstring ambientText(const Ambient &a) {
+	if (a.source == AmbientSource::None)
+		return L"No ambient light reading";
+	const AmbientReading &r    = a.reading;
+	std::wstring          text = luxText(r.lux) + L" lx";
+	wchar_t               buf[128];
+	if (r.hasColour && r.colorTemp > 0.f) {
+		swprintf_s(buf, L", %.0fK", r.colorTemp);
+		text += buf;
+	}
+	if (r.hasColour && (r.chromaX > 0.f || r.chromaY > 0.f)) {
+		swprintf_s(buf, L", x=%.4f y=%.4f CIE 1931", r.chromaX, r.chromaY);
+		text += buf;
+	}
+	text += a.source == AmbientSource::Native ? L" (native sensor)" : a.source == AmbientSource::Another ? L" (another sensor)" : L" (last reading)";
+	return text;
+}
+
+// Without a display there is no "its own sensor" to start from, so the line is blank and grey then.
+static void showAmbient(HWND d, const SliderState &st) {
+	enableDlgItem(d, IDC_AMBIENT_LABEL, st.hasDisplay);
+	showText(d, IDC_AMBIENT_VALUE, st.hasDisplay ? ambientText(st.ambient) : std::wstring());
+}
+
 static void showAutoStatus(HWND d, const SliderState &st) {
 	bool         on = st.usable() && autoBrightnessTicked(d);
 	std::wstring text;
-	if (on && !st.luxLive) {
+	if (on && !st.ambient.live()) {
 		text = L"No ambient light reading, so there is nothing to follow";
 	} else if (on) {
 		wchar_t buf[160];
 		swprintf_s(buf, L"Set: %d %% at %s lx of ambient light \u00B7 Now: %d %% at %s lx of ambient light",
-		           st.basePercent(), luxText(st.baseLux).c_str(), st.percent(), luxText(st.lux).c_str());
+		           st.basePercent(), luxText(st.baseLux).c_str(), st.percent(), luxText(st.ambient.reading.lux).c_str());
 		text = buf;
 	}
-	wchar_t shown[160] = {};
-	GetDlgItemTextW(d, IDC_AUTO_STATUS, shown, 160);
-	if (text != shown) // rewriting the same text would only make it flicker
-		SetDlgItemTextW(d, IDC_AUTO_STATUS, text.c_str());
+	showText(d, IDC_AUTO_STATUS, text);
 
 	// The limits are taken from their fields rather than from the settings, so that the marks
 	// show what the numbers in the dialog would do before they are saved.
@@ -1096,6 +1147,7 @@ static void showBrightnessState(HWND d, const SliderState &st, bool opening) {
 	checkDlgItem(d, IDC_AUTO_BRIGHTNESS, g_settings.autoAdjustEnabled.load());
 	enableDlgItem(d, IDC_AUTO_BRIGHTNESS, !st.hdr && !st.locked);
 	updateAutoFields(d);
+	showAmbient(d, st);
 	showAutoStatus(d, st);
 
 	// Follow the display, but not mid-drag and not after the slider's own change: a position is
@@ -1273,6 +1325,14 @@ static const wchar_t kSyncHelp[] =
     L"and when the displays come back on after sleep. Displays of different models are matched in nits, so that "
     L"they look equally bright.\r\n\r\n"
     L"Automatic brightness and the color preset stay separate for each display.";
+static const wchar_t kAmbientHelp[] =
+    L"The reading is looked for in this order:\r\n\r\n"
+    L"1. The display's own sensor.\r\n"
+    L"2. The sensor of any other Apple display.\r\n"
+    L"3. Any Windows ambient light sensor, for example the one built into a laptop.\r\n"
+    L"4. The last known value.\r\n\r\n"
+    L"Please note that another sensor is in a different place and does not measure the light that falls on "
+    L"the selected display.";
 static const wchar_t kBrightenLimitHelp[] =
     L"How far automatic brightness may raise the brightness above the level you set, in percent of the "
     L"brightness slider.\r\n\r\n"
@@ -1294,6 +1354,7 @@ static const struct {
 	const wchar_t *text;
 } kHelpTexts[] = {{IDC_AUTO_ROTATE, kRotateHelp},
                   {IDC_LINK_DISPLAYS, kSyncHelp},
+                  {IDC_AMBIENT_LABEL, kAmbientHelp},
                   {IDC_BRIGHTEN_LIMIT_LABEL, kBrightenLimitHelp},
                   {IDC_DIM_LIMIT_LABEL, kDimLimitHelp},
                   {IDC_STEPS_LABEL, kStepsHelp}};

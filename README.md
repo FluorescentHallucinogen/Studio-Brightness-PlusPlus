@@ -118,6 +118,7 @@ To remove it, use Windows Settings, Apps, "Installed apps", which also clears yo
   - Choose a color preset (Apple Reference Mode) for that display; hovering a preset in the open list, or moving to it with the arrow keys, shows the description the display provides for it
   - Adjust brightness with the Dim/Bright slider, applied as you drag, or type an exact level in percent next to it
   - With two or more displays: tick "Sync manual brightness across displays" to have a brightness change made by hand go to every display, matched in nits. It is also in the tray menu, and takes effect at once
+  - See the ambient light reading used for the selected display: lux, plus color temperature and CIE 1931 chromaticity when the sensor reports them, and whether it comes from the display's own sensor, from another sensor or is the last reading there was. Hovering the label shows the order in which sensors are tried
   - Toggle automatic brightness; like the slider, it takes effect at once. While it is on, a line under the checkbox shows the level you set and the ambient light it was set in, next to the level and the ambient light now, and a tick mark on the slider marks the level you set
   - Limit how far automatic brightness may go above and below the level you set (0-100 % of the slider each; 100, the default, means no limit). The slider highlights the range the limits leave and has a tick at each limit
   - Set how long an automatic brightness change takes, separately for brightening and for dimming (0-60000 ms)

@@ -61,6 +61,10 @@
 #define IDC_DISPLAY_COMBO         1601
 #define IDC_LINK_DISPLAYS         1602
 
+// Ambient light (Options Dialog)
+#define IDC_AMBIENT_LABEL         1701
+#define IDC_AMBIENT_VALUE         1702
+
 // Hotkey IDs
 #define ID_HOTKEY_UP   4001
 #define ID_HOTKEY_DOWN 4002
