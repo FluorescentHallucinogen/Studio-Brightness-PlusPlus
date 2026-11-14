@@ -45,6 +45,9 @@ FONT 9, "Segoe UI"
 BEGIN
     // The dialog reads top to bottom: a control only ever disables or hides controls under it, never
     // one above it. Labels, checkboxes and the status line all start at the same left edge.
+    // Up and down, a row of inputs is only roughed out here. When the dialog opens, every input gets
+    // the height of a dropdown list and every label is put level with the text of the input beside
+    // it (layOutRows in main.cpp), because neither comes out right from dialog units at every scaling.
     CONTROL "Run at Windows startup",      IDC_RUN_AT_STARTUP,  "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 8, 180, 12
     // Has a tooltip, so it is no wider than its text needs: the tooltip and the help cursor then
     // belong to the text and not to empty space after it. The same goes for the sync checkbox below.

@@ -61,6 +61,7 @@ constexpr wchar_t kAppVersion[] = SBPP_VERSION_STR;
 
 // Update state, filled by the background update-check thread.
 constexpr UINT     WMAPP_UPDATE_READY = WM_APP + 2;
+constexpr UINT     WMAPP_OPTIONS_ROWS = WM_APP + 3; // Options dialog: lay its rows out again (see layOutRows)
 constexpr UINT_PTR ID_UPDATE_TIMER    = 0xA001;
 constexpr UINT_PTR ID_HDR_TIMER       = 0xA002;
 constexpr UINT_PTR ID_REAPPLY_TIMER   = 0xA003;
@@ -966,6 +967,7 @@ struct OptionsState {
 	DisplaysView shown;             // what the display and preset lists were last filled from
 	bool         filled  = false;   // not before the first fill
 	HWND         lockTip = nullptr; // the tooltip saying why the brightness controls are disabled
+	HWND         helpTip = nullptr; // the tooltip with the longer explanations (see addHelpTexts)
 	SliderMarks  marks;             // what the slider has been given to mark
 };
 static OptionsState *optionsState(HWND d) {
@@ -1121,6 +1123,143 @@ static HWND createWrappedTooltip(HWND d) {
 	return tip;
 }
 
+/* ---------- rows: inputs of one height, labels on the inputs' line of text ---------- */
+static RECT rectInDialog(HWND d, HWND ctrl) {
+	RECT rc;
+	GetWindowRect(ctrl, &rc);
+	MapWindowPoints(nullptr, d, (POINT *)&rc, 2);
+	return rc;
+}
+static void moveInDialog(HWND ctrl, const RECT &rc) {
+	SetWindowPos(ctrl, nullptr, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+static bool isClass(HWND ctrl, const wchar_t *name) {
+	wchar_t cls[64] = {};
+	GetClassNameW(ctrl, cls, 64);
+	return lstrcmpiW(cls, name) == 0;
+}
+
+// Where an input's line of text begins, counted from the top of the dialog.
+static int textLineTop(HWND d, HWND input, int lineHeight) {
+	POINT at = {0, 0};
+	if (isClass(input, WC_COMBOBOXW)) {
+		COMBOBOXINFO cbi = {sizeof(cbi)}; // in the middle of the part beside the button
+		GetComboBoxInfo(input, &cbi);
+		at.y = (cbi.rcItem.top + cbi.rcItem.bottom - lineHeight) / 2;
+	} else if (isClass(input, WC_EDITW)) {
+		RECT text = {};
+		SendMessageW(input, EM_GETRECT, 0, (LPARAM)&text);
+		at.y = text.top;
+	} else {
+		at.y = GetSystemMetrics(SM_CYBORDER); // a hotkey box: one border in
+	}
+	MapWindowPoints(input, d, &at, 1);
+	return at.y;
+}
+
+// The template is laid out in dialog units, and two things in it do not go by them. A dropdown
+// list ignores the height it is given: it takes the height of the font plus a few pixels that
+// do not grow with the scaling. An edit box does take the height it is given, and puts its text
+// at the top of it. So the higher the scaling, the lower the lists are next to the other
+// inputs, the further the text of those sits above their middle, and the further every label is
+// off the text beside it: an offset in the template is right at one scaling only.
+// This sets the rows right from what the controls measure:
+//  - an edit box or a hotkey box gets the height of a dropdown list, around its own middle;
+//  - a dropdown list goes to the middle of the row the template gives it. Only when the dialog
+//    opens: it is the one step here that would not come out the same if repeated;
+//  - a label goes onto the line of text of the input it shares a row with;
+//  - the slider goes with its channel on the middle of that line.
+// Runs when the dialog opens and again after Windows has rescaled the dialog for a monitor
+// with another scaling, which stretches or shrinks every control alike.
+static void layOutRows(HWND d, bool opening) {
+	RECT rc     = rectInDialog(d, GetDlgItem(d, IDC_PRESET_COMBO));
+	int  height = rc.bottom - rc.top; // of a dropdown list, and so of every input
+	RECT row    = {0, 0, 0, 14};      // the height of a row of inputs in the template, in dialog units
+	MapDialogRect(d, &row);
+
+	TEXTMETRICW tm  = {};
+	HDC         dc  = GetDC(d);
+	HGDIOBJ     old = SelectObject(dc, (HFONT)SendMessageW(d, WM_GETFONT, 0, 0));
+	GetTextMetricsW(dc, &tm);
+	SelectObject(dc, old);
+	ReleaseDC(d, dc);
+
+	// A spin control sits inside the edit box it belongs to: note where, before the box changes.
+	struct Spin {
+		HWND spin, edit;
+		int  top, bottom; // how far in from the top and the bottom of the edit box
+	};
+	std::vector<Spin> spins;
+	for (HWND c = GetWindow(d, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+		HWND edit = isClass(c, UPDOWN_CLASSW) ? (HWND)SendMessageW(c, UDM_GETBUDDY, 0, 0) : nullptr;
+		if (!edit)
+			continue;
+		RECT s = rectInDialog(d, c), e = rectInDialog(d, edit);
+		spins.push_back({c, edit, s.top - e.top, e.bottom - s.bottom});
+	}
+
+	std::vector<HWND> inputs;
+	for (HWND c = GetWindow(d, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+		rc = rectInDialog(d, c);
+		if (isClass(c, WC_COMBOBOXW)) {
+			if (opening) // moved, not sized: the size of a dropdown list is the size of its open list
+				SetWindowPos(c, nullptr, rc.left, rc.top + (row.bottom - height) / 2, 0, 0,
+				             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+		} else if (isClass(c, WC_EDITW) || isClass(c, HOTKEY_CLASSW)) {
+			rc.top    = (rc.top + rc.bottom - height) / 2;
+			rc.bottom = rc.top + height;
+			moveInDialog(c, rc);
+		} else {
+			continue;
+		}
+		inputs.push_back(c);
+	}
+	for (const Spin &s : spins) {
+		RECT e    = rectInDialog(d, s.edit);
+		rc        = rectInDialog(d, s.spin);
+		rc.top    = e.top + s.top;
+		rc.bottom = e.bottom - s.bottom;
+		moveInDialog(s.spin, rc);
+	}
+
+	// A label shares a row with the input that its middle is level with.
+	for (HWND c = GetWindow(d, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+		if (!isClass(c, WC_STATICW))
+			continue;
+		rc         = rectInDialog(d, c);
+		int middle = (rc.top + rc.bottom) / 2;
+		for (HWND input : inputs) {
+			RECT in = rectInDialog(d, input);
+			if (middle < in.top || middle >= in.bottom)
+				continue;
+			OffsetRect(&rc, 0, textLineTop(d, input, tm.tmHeight) - rc.top);
+			moveInDialog(c, rc);
+			break;
+		}
+	}
+
+	// The slider's row takes its line from the percent field.
+	HWND slider  = GetDlgItem(d, IDC_BRIGHTNESS_SLIDER);
+	RECT channel = {};
+	SendMessageW(slider, TBM_GETCHANNELRECT, 0, (LPARAM)&channel);
+	POINT middle = {0, (channel.top + channel.bottom) / 2};
+	MapWindowPoints(slider, d, &middle, 1);
+	rc = rectInDialog(d, slider);
+	OffsetRect(&rc, 0, textLineTop(d, GetDlgItem(d, IDC_SLIDER_PERCENT), tm.tmHeight) + tm.tmHeight / 2 - middle.y);
+	moveInDialog(slider, rc);
+}
+
+// A tooltip tool that is a place in the dialog, not a control (see addHelpTexts), has to be
+// told when the control it stands for has moved. Nothing happens if the tooltip has no such tool.
+static void moveRectTool(HWND d, HWND tip, int ctrlId) {
+	TTTOOLINFOW ti = {sizeof(ti)};
+	ti.hwnd        = d;
+	ti.uId         = (UINT_PTR)ctrlId;
+	ti.rect        = rectInDialog(d, GetDlgItem(d, ctrlId));
+	if (tip)
+		SendMessageW(tip, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
+}
+
 // Longer explanations, each shown as a tooltip when hovering the control it belongs to. The
 // same controls get the help cursor (see WM_SETCURSOR).
 static const wchar_t kRotateHelp[] =
@@ -1166,10 +1305,10 @@ static bool hasHelpText(int ctrlId) {
 	return false;
 }
 
-static void addHelpTexts(HWND d) {
+static HWND addHelpTexts(HWND d) {
 	HWND tip = createWrappedTooltip(d);
 	if (!tip)
-		return;
+		return nullptr;
 	SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000); // long enough to read
 	for (const auto &help : kHelpTexts) {
 		// Twice. On the control itself, for when the mouse is the control's. And on the place
@@ -1185,10 +1324,10 @@ static void addHelpTexts(HWND d) {
 
 		ti.uFlags = TTF_SUBCLASS;
 		ti.uId    = (UINT_PTR)help.ctrlId;
-		GetWindowRect(ctrl, &ti.rect);
-		MapWindowPoints(nullptr, d, (POINT *)&ti.rect, 2);
+		ti.rect   = rectInDialog(d, ctrl);
 		SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
 	}
+	return tip;
 }
 
 /* ---------- preset descriptions as tooltips on the dropdown items ---------- */
@@ -1384,7 +1523,7 @@ static void fillDisplayControls(HWND d, const DisplaysView &v, OptionsState &os)
 	// Windows to turn it off from here (it may refuse).
 	const wchar_t *note = !v.hdr        ? L""
 	                    : !have         ? L"HDR is on"
-	                    : shown.empty() ? L"Disable HDR to change the color preset"
+	                    : shown.empty() ? L"Disable HDR to unlock presets and brightness controls"
 	                                    : L"HDR is on: only the Apple XDR presets are available";
 	SetDlgItemTextW(d, IDC_PRESET_NOTE, note);
 	HWND hdrOff = GetDlgItem(d, IDC_HDR_OFF_BTN);
@@ -1411,14 +1550,11 @@ static void fillDisplayControls(HWND d, const DisplaysView &v, OptionsState &os)
 		if (!IsWindowEnabled(combo))
 			targets.push_back(IDC_PRESET_COMBO);
 		for (int ctrlId : targets) {
-			RECT rc;
-			GetWindowRect(GetDlgItem(d, ctrlId), &rc);
-			MapWindowPoints(nullptr, d, (POINT *)&rc, 2);
 			TTTOOLINFOW ti = {sizeof(ti)};
 			ti.uFlags      = TTF_SUBCLASS;
 			ti.hwnd        = d;
 			ti.uId         = (UINT_PTR)ctrlId;
-			ti.rect        = rc;
+			ti.rect        = rectInDialog(d, GetDlgItem(d, ctrlId));
 			ti.lpszText    = (LPWSTR)why;
 			SendMessageW(os.lockTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
 		}
@@ -1471,7 +1607,9 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 		EnableWindow(GetDlgItem(d, IDC_HOTKEY_DOWN), g_settings.enableCustomHotkeys);
 		setDlgHotkey(d, IDC_HOTKEY_UP, g_settings.hkUp);
 		setDlgHotkey(d, IDC_HOTKEY_DOWN, g_settings.hkDown);
-		addHelpTexts(d);
+		layOutRows(d, true); // before the tooltips, which go by where the controls are
+		if (OptionsState *os = optionsState(d))
+			os->helpTip = addHelpTexts(d);
 		initNumberFields(d);
 
 		// The brightness slider: the control Boot Camp Control Panel uses, 0 to 100, with Dim and
@@ -1488,6 +1626,20 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 		SetTimer(d, ID_OPTIONS_TIMER, 200, nullptr);
 		return TRUE;
 	}
+	case WM_DPICHANGED:
+		// Moved to a monitor with another scaling. Windows rescales the dialog and everything in
+		// it once this message has gone unanswered; the rows are seen to after that.
+		PostMessageW(d, WMAPP_OPTIONS_ROWS, 0, 0);
+		break;
+	case WMAPP_OPTIONS_ROWS:
+		layOutRows(d, false);
+		if (const OptionsState *os = optionsState(d)) {
+			for (const auto &help : kHelpTexts)
+				moveRectTool(d, os->helpTip, help.ctrlId);
+			for (int ctrlId : {IDC_AUTO_BRIGHTNESS, IDC_BRIGHTNESS_SLIDER, IDC_PRESET_COMBO})
+				moveRectTool(d, os->lockTip, ctrlId);
+		}
+		return TRUE;
 	case WM_NOTIFY: {
 		const NMHDR *nm = (const NMHDR *)lp;
 		if (nm->idFrom != IDC_BRIGHTNESS_SLIDER || nm->code != NM_CUSTOMDRAW)
