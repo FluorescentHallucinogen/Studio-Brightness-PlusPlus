@@ -1713,7 +1713,7 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 			return TRUE;
 		}
 		if (id == IDC_LINK_DISPLAYS && code == BN_CLICKED) {
-			// At once, like the tray menu item of the same name: the slider below already acts on it.
+			// At once, like the tray menu item of the same name: the slider above already acts on it.
 			g_settings.linkedMode = IsDlgButtonChecked(d, IDC_LINK_DISPLAYS) == BST_CHECKED;
 			g_settings.Save();
 			return TRUE;

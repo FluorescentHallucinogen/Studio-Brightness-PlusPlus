@@ -116,8 +116,8 @@ To remove it, use Windows Settings, Apps, "Installed apps", which also clears yo
   - Toggle automatic rotation
   - With two or more displays: pick the display that the color preset and the brightness slider below belong to. It takes effect at once, as in the tray menu
   - Choose a color preset (Apple Reference Mode) for that display; hovering a preset in the open list, or moving to it with the arrow keys, shows the description the display provides for it
-  - With two or more displays: tick "Sync manual brightness across displays" to have a brightness change made by hand go to every display, matched in nits. It is also in the tray menu, and takes effect at once
   - Adjust brightness with the Dim/Bright slider, applied as you drag, or type an exact level in percent next to it
+  - With two or more displays: tick "Sync manual brightness across displays" to have a brightness change made by hand go to every display, matched in nits. It is also in the tray menu, and takes effect at once
   - Toggle automatic brightness; like the slider, it takes effect at once. While it is on, a line under the checkbox shows the level you set and the ambient light it was set in, next to the level and the ambient light now, and a tick mark on the slider marks the level you set
   - Limit how far automatic brightness may go above and below the level you set (0-100 % of the slider each; 100, the default, means no limit). The slider highlights the range the limits leave and has a tick at each limit
   - Set how long an automatic brightness change takes, separately for brightening and for dimming (0-60000 ms)
