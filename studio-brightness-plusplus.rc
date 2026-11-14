@@ -92,7 +92,8 @@ BEGIN
     LTEXT   "", IDC_AMBIENT_VALUE, 60, 154, 212, 9, SS_NOPREFIX | SS_ENDELLIPSIS
 
     // Takes effect at once, like the tray menu item: the line and the fields under it follow it.
-    CONTROL "Enable automatic brightness", IDC_AUTO_BRIGHTNESS, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 168, 180, 12
+    // Has a tooltip, so it is no wider than its text needs, like the two checkboxes above that have one.
+    CONTROL "Enable automatic brightness", IDC_AUTO_BRIGHTNESS, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 168, 110, 12
 
     // What automatic brightness is working from; filled in by OptionsDlgProc while it is on. One line:
     // the dialog's width is set by this line at its longest.

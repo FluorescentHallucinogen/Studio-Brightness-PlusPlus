@@ -1333,6 +1333,17 @@ static const wchar_t kAmbientHelp[] =
     L"4. The last known value.\r\n\r\n"
     L"Please note that another sensor is in a different place and does not measure the light that falls on "
     L"the selected display.";
+static const wchar_t kAutoHelp[] =
+    L"Adjusts the brightness as the ambient light changes.\r\n\r\n"
+    L"Each time you set the brightness level by hand, with a slider or the shortcuts, that value and the "
+    L"ambient light value at that moment become the new reference point.\r\n\r\n"
+    L"From then on the target point is that level scaled by how much the ambient light has changed.\r\n\r\n"
+    L"For example, 40 % set in 200 lx becomes about 20 % in 100 lx and about 80 % in 400 lx.\r\n\r\n"
+    L"It reacts only when the light changes by 20 % or more, and moves to the new level gradually.\r\n\r\n"
+    L"The limits and times below set how far and how fast it may go.\r\n\r\n"
+    L"It works for each display separately, from the sensor shown in \"Ambient light\", and does nothing "
+    L"while HDR is on, while a color preset fixes the brightness, or while no sensor is reporting.\r\n\r\n"
+    L"The line below shows the reference (Set) and the current brightness (Now).";
 static const wchar_t kBrightenLimitHelp[] =
     L"How far automatic brightness may raise the brightness above the level you set, in percent of the "
     L"brightness slider.\r\n\r\n"
@@ -1352,17 +1363,23 @@ static const wchar_t kStepsHelp[] =
 static const struct {
 	int            ctrlId;
 	const wchar_t *text;
-} kHelpTexts[] = {{IDC_AUTO_ROTATE, kRotateHelp},
-                  {IDC_LINK_DISPLAYS, kSyncHelp},
-                  {IDC_AMBIENT_LABEL, kAmbientHelp},
-                  {IDC_BRIGHTEN_LIMIT_LABEL, kBrightenLimitHelp},
-                  {IDC_DIM_LIMIT_LABEL, kDimLimitHelp},
-                  {IDC_STEPS_LABEL, kStepsHelp}};
+	// Whether the explanation is also there while the control is disabled. Not for the automatic
+	// brightness checkbox: it is disabled only by HDR or by a color preset, and then it has the
+	// tooltip that says which (see fillDisplayControls).
+	bool whenDisabled;
+} kHelpTexts[] = {{IDC_AUTO_ROTATE, kRotateHelp, true},
+                  {IDC_LINK_DISPLAYS, kSyncHelp, true},
+                  {IDC_AMBIENT_LABEL, kAmbientHelp, true},
+                  {IDC_AUTO_BRIGHTNESS, kAutoHelp, false},
+                  {IDC_BRIGHTEN_LIMIT_LABEL, kBrightenLimitHelp, true},
+                  {IDC_DIM_LIMIT_LABEL, kDimLimitHelp, true},
+                  {IDC_STEPS_LABEL, kStepsHelp, true}};
 
-static bool hasHelpText(int ctrlId) {
+// Whether hovering this control shows a help text right now.
+static bool showsHelpText(HWND d, int ctrlId) {
 	for (const auto &help : kHelpTexts)
 		if (help.ctrlId == ctrlId)
-			return true;
+			return help.whenDisabled || IsWindowEnabled(GetDlgItem(d, ctrlId));
 	return false;
 }
 
@@ -1374,7 +1391,8 @@ static HWND addHelpTexts(HWND d) {
 	for (const auto &help : kHelpTexts) {
 		// Twice. On the control itself, for when the mouse is the control's. And on the place
 		// the control takes up in the dialog, for when the control is disabled and the mouse is
-		// the dialog's instead: the explanation matters no less then.
+		// the dialog's instead: the explanation matters no less then. The second one is left out
+		// for a control that has another tooltip while it is disabled.
 		HWND        ctrl = GetDlgItem(d, help.ctrlId);
 		TTTOOLINFOW ti   = {sizeof(ti)};
 		ti.uFlags        = TTF_IDISHWND | TTF_SUBCLASS;
@@ -1382,6 +1400,8 @@ static HWND addHelpTexts(HWND d) {
 		ti.uId           = (UINT_PTR)ctrl;
 		ti.lpszText      = (LPWSTR)help.text;
 		SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+		if (!help.whenDisabled)
+			continue;
 
 		ti.uFlags = TTF_SUBCLASS;
 		ti.uId    = (UINT_PTR)help.ctrlId;
@@ -1696,7 +1716,8 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 		layOutRows(d, false);
 		if (const OptionsState *os = optionsState(d)) {
 			for (const auto &help : kHelpTexts)
-				moveRectTool(d, os->helpTip, help.ctrlId);
+				if (help.whenDisabled)
+					moveRectTool(d, os->helpTip, help.ctrlId);
 			for (int ctrlId : {IDC_AUTO_BRIGHTNESS, IDC_BRIGHTNESS_SLIDER, IDC_PRESET_COMBO})
 				moveRectTool(d, os->lockTip, ctrlId);
 		}
@@ -1732,12 +1753,12 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 		return TRUE;
 	}
 	case WM_SETCURSOR: {
-		// A control that has a help tooltip says so with the help cursor. It is found by where
+		// A control that shows a help tooltip says so with the help cursor. It is found by where
 		// the mouse is and not by who has the mouse: over a disabled control that is the dialog.
 		POINT at;
 		GetCursorPos(&at);
 		ScreenToClient(d, &at);
-		if (LOWORD(lp) != HTCLIENT || !hasHelpText(GetDlgCtrlID(ChildWindowFromPointEx(d, at, CWP_SKIPINVISIBLE))))
+		if (LOWORD(lp) != HTCLIENT || !showsHelpText(d, GetDlgCtrlID(ChildWindowFromPointEx(d, at, CWP_SKIPINVISIBLE))))
 			break;
 		SetCursor(LoadCursorW(nullptr, IDC_HELP));
 		SetWindowLongPtrW(d, DWLP_MSGRESULT, TRUE);
