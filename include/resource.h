@@ -44,7 +44,7 @@
 #define IDC_DIM_LIMIT_SPIN        1313
 #define IDC_DIM_LIMIT_LABEL       1314
 
-// Color preset (Options Dialog)
+// Preset (Options Dialog)
 #define IDC_PRESET_NOTE           1401
 #define IDC_PRESET_COMBO          1402
 #define IDC_HDR_OFF_BTN           1403
@@ -64,6 +64,12 @@
 // Ambient light (Options Dialog)
 #define IDC_AMBIENT_LABEL         1701
 #define IDC_AMBIENT_VALUE         1702
+
+// Options dialog: its size in dialog units, and what its scrolling part needs
+#define OPTIONS_DLG_W             280
+#define OPTIONS_DLG_H             386
+#define IDC_OPTIONS_SCROLL        1801
+#define IDC_OPTIONS_EDGE          1802
 
 // Hotkey IDs
 #define ID_HOTKEY_UP   4001

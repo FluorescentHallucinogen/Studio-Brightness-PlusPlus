@@ -41,7 +41,7 @@
 - **Display detection** showing connected Apple display(s) in the tray menu
 - **Log viewer** with real-time diagnostics accessible from the tray menu
 - **Generic Apple display support** for unknown Apple displays with valid HID brightness caps
-- **Color presets** to switch the display's Apple Reference Mode (color profile) from the Options dialog
+- **Presets** to switch the display's Apple Reference Mode (color profile) from the Options dialog
 - **Automatic updates** from GitHub with selectable stable and beta channels, installed in one click
 - Runs in the system tray, lightweight and easy to use
 
@@ -78,7 +78,7 @@ Compared to the original [studio-brightness](https://github.com/sfjohnson/studio
 - **Settings persistence** with all options saved to Windows Registry and restored on restart.
 - **Run at Windows startup** as an optional auto-launch setting.
 - **Robust device detection** with profile-based matching, ContainerId correlation, and automatic reconnection.
-- **Color presets** to read and switch the display's Apple Reference Modes (color profiles), discovered per display and remembered.
+- **Presets** to read and switch the display's Apple Reference Modes (color profiles), discovered per display and remembered.
 - **MSI installer** with an optional desktop shortcut and a launch-on-finish option, plus a clean uninstall that removes settings.
 - **In-app auto-update** that checks GitHub Releases directly, with stable and beta channels and one-click install.
 
@@ -114,18 +114,20 @@ To remove it, use Windows Settings, Apps, "Installed apps", which also clears yo
 - **Options...:** Right-click the tray icon > "Options...". You can:
   - Enable "Run at Windows startup"
   - Toggle automatic rotation
-  - With two or more displays: pick the display that the color preset and the brightness slider below belong to. It takes effect at once, as in the tray menu
-  - Choose a color preset (Apple Reference Mode) for that display; hovering a preset in the open list, or moving to it with the arrow keys, shows the description the display provides for it
+  - With two or more displays: pick the display that the preset and the brightness slider below belong to. It takes effect at once, as in the tray menu
+  - Choose a preset (Apple Reference Mode) for that display; hovering a preset in the open list, or moving to it with the arrow keys, shows the description the display provides for it
   - Adjust brightness with the Dim/Bright slider, applied as you drag, or type an exact level in percent next to it
   - With two or more displays: tick "Sync manual brightness across displays" to have a brightness change made by hand go to every display, matched in nits. It is also in the tray menu, and takes effect at once
   - See the ambient light reading used for the selected display: lux, plus color temperature and CIE 1931 chromaticity when the sensor reports them, and whether it comes from the display's own sensor, from another sensor or is the last reading there was. Hovering the label shows the order in which sensors are tried
-  - Toggle automatic brightness; like the slider, it takes effect at once. Hovering the checkbox explains how it works. While it is on, a line under the checkbox shows the level you set and the ambient light it was set in, next to the level and the ambient light now, and a tick mark on the slider marks the level you set
+  - Toggle automatic brightness; like the slider, it takes effect at once. Hovering its label explains how it works. While it is on, a line under the checkbox shows the level you set and the ambient light it was set in, next to the level and the ambient light now, and a tick mark on the slider marks the level you set
   - Limit how far automatic brightness may go above and below the level you set (0-100 % of the slider each; 100, the default, means no limit). The slider highlights the range the limits leave and has a tick at each limit
   - Set how long an automatic brightness change takes, separately for brightening and for dimming (0-60000 ms)
   - Set the number of steps (10-50) for the native and custom brightness shortcuts: one press changes brightness by that fraction of the range, so fewer steps means a bigger change per press
   - Show or hide the brightness level on screen (the OSD) when using the native and custom shortcuts
   - Enable custom brightness shortcuts and set the custom increase and decrease brightness shortcuts
   - Click "Reset to Defaults" to restore default settings
+  - Resize the window: on a screen that is not tall enough for it, it opens lower and everything but the buttons scrolls; made wider, it gives the room to the lists, the slider and the shortcut boxes
+  - Hover a label for an explanation where the cursor turns into the help cursor. Over a control that is disabled the cursor shows "unavailable", with the reason as a tooltip where there is one
   - All settings are automatically saved to the Windows Registry
 - **Logs...:** Right-click the tray icon > "Logs..." to open the real-time log viewer. Useful for diagnostics and troubleshooting.
 - **Updates:** The app checks for a new version on launch and once a day. When one is available you get a notification and an "Install update" item appears in the tray menu; one click downloads it, installs it, and relaunches. Right-click the tray icon and use "Update channel" to pick "Stable only" or "Include betas", or "Check update" to check right away.

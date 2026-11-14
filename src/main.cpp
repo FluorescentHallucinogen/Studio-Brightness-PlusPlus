@@ -62,6 +62,7 @@ constexpr wchar_t kAppVersion[] = SBPP_VERSION_STR;
 // Update state, filled by the background update-check thread.
 constexpr UINT     WMAPP_UPDATE_READY = WM_APP + 2;
 constexpr UINT     WMAPP_OPTIONS_ROWS = WM_APP + 3; // Options dialog: lay its rows out again (see layOutRows)
+constexpr UINT     WMAPP_OPTIONS_SHOW = WM_APP + 4; // Options dialog: scroll a control (wParam) into view
 constexpr UINT_PTR ID_UPDATE_TIMER    = 0xA001;
 constexpr UINT_PTR ID_HDR_TIMER       = 0xA002;
 constexpr UINT_PTR ID_REAPPLY_TIMER   = 0xA003;
@@ -89,20 +90,20 @@ static std::atomic<bool>          g_rescanRequested{false};
 // Set by ID_REAPPLY_TIMER once the displays are back on; the worker sends the brightness again.
 static std::atomic<bool>          g_reapplyRequested{false};
 
-/* ---------- Per-display color-preset persistence (HKCU\...\Presets\{ContainerId}) ---------- */
+/* ---------- Per-display preset persistence (HKCU\...\Presets\{ContainerId}) ---------- */
 static std::wstring guidToString(const GUID &g) {
 	wchar_t buf[64] = {};
 	StringFromGUID2(g, buf, 64);
 	return buf;
 }
-// Revert a display's color preset to a previous index, located by ContainerId so it still works
+// Revert a display's preset to a previous index, located by ContainerId so it still works
 // after the HID re-enumeration a preset switch triggers (the DisplayDevice object gets replaced).
 static bool tryRevertPreset(const GUID &cid, int prevIdx) {
 	std::lock_guard<std::mutex> lock(g_displayMutex);
 	for (auto &dev : g_displays)
 		if (memcmp(&dev.containerId, &cid, sizeof(GUID)) == 0 && dev.hPreset != INVALID_HANDLE_VALUE) {
 			if (dev.setActivePreset(prevIdx) == 0) {
-				Log::Info(L"Color preset reverted to %d on %s", prevIdx, dev.name.c_str());
+				Log::Info(L"Preset reverted to %d on %s", prevIdx, dev.name.c_str());
 				return true;
 			}
 		}
@@ -110,7 +111,7 @@ static bool tryRevertPreset(const GUID &cid, int prevIdx) {
 }
 static void RevertPresetByContainer(const GUID &cid, int prevIdx) {
 	if (prevIdx < 0) return;
-	Log::Info(L"Reverting color preset to %d", prevIdx);
+	Log::Info(L"Reverting preset to %d", prevIdx);
 	if (tryRevertPreset(cid, prevIdx))
 		return;
 	// The switch re-enumerates the display's HID interface (a disconnect), so the device may not
@@ -152,7 +153,7 @@ static void RevertPresetByContainer(const GUID &cid, int prevIdx) {
 // Cache of enumerated presets (so we don't re-write the 0xFF20 cursor on every reconnect) and a
 // once-per-run default-reset guard. Switching a calibrated preset re-enumerates the display's HID
 // descriptor (a disconnect), so re-applying on each reconnect would loop. Keyed by ContainerId.
-static std::map<std::wstring, std::vector<ColorPreset>> g_presetCache;
+static std::map<std::wstring, std::vector<Preset>> g_presetCache;
 static std::set<std::wstring>                           g_presetRestored;
 
 // GDI+
@@ -238,7 +239,7 @@ static void RefreshHdrState() {
 			for (auto &dev : g_displays) {
 				if (!dev.hasPresets() || !dev.presetsClassifiable())
 					continue;
-				const ColorPreset *ap = dev.activePreset();
+				const Preset *ap = dev.activePreset();
 				if (!ap || ap->isHdrCompatible())
 					continue;
 				int tgt = dev.firstHdrCompatiblePreset();
@@ -748,7 +749,7 @@ static ULONG applySliderPercent(int pct, ULONG refMin, ULONG refMax) {
 }
 
 /* ---------- the displays, as the Options dialog lists them ---------- */
-// Which displays there are, which of them is the active one, and that one's color presets. The
+// Which displays there are, which of them is the active one, and that one's presets. The
 // dialog fills its display and preset lists from this, and compares it with a fresh one to tell
 // when they need filling again: displays come and go, the tray menu can make another one
 // active, and HDR changes which presets may be offered.
@@ -758,14 +759,14 @@ struct DisplaysView {
 	int                       active = -1;    // position of the active display, -1 when there is none
 	bool                      hdr    = false;
 	bool                      locked = false; // the active display's preset fixes its brightness
-	std::vector<ColorPreset>  presets;        // of the active display
+	std::vector<Preset>       presets;        // of the active display
 	int                       activePreset = -1;
 
 	bool sameAs(const DisplaysView &o) const {
 		return names == o.names && paths == o.paths && active == o.active && hdr == o.hdr && locked == o.locked &&
 		       activePreset == o.activePreset &&
 		       std::equal(presets.begin(), presets.end(), o.presets.begin(), o.presets.end(),
-		                  [](const ColorPreset &a, const ColorPreset &b) {
+		                  [](const Preset &a, const Preset &b) {
 			                  return a.index == b.index && a.name == b.name && a.desc == b.desc;
 		                  });
 	}
@@ -982,12 +983,30 @@ struct SliderMarks {
 };
 
 // What an open Options dialog keeps between messages, in its DWLP_USER.
+// One control of the part of the dialog that scrolls: everything but the buttons at the bottom.
+struct PageItem {
+	HWND ctrl;
+	RECT at;      // where the layout puts it: the dialog at its design width, scrolled to the top
+	int  open;    // a dropdown list: its height with the list open, which is the height it is sized by
+	int  follow;  // the dialog's right edge: 0 not at all, 1 with its own right edge, 2 as a whole
+	bool clipped; // has a window region at the moment
+};
 struct OptionsState {
-	DisplaysView shown;             // what the display and preset lists were last filled from
-	bool         filled  = false;   // not before the first fill
-	HWND         lockTip = nullptr; // the tooltip saying why the brightness controls are disabled
-	HWND         helpTip = nullptr; // the tooltip with the longer explanations (see addHelpTexts)
-	SliderMarks  marks;             // what the slider has been given to mark
+	DisplaysView shown;            // what the display and preset lists were last filled from
+	bool         filled = false;   // not before the first fill
+	HWND         tip    = nullptr; // the tooltip: the explanations, and why a control is disabled
+	SliderMarks  marks;            // what the slider has been given to mark
+
+	// The scrolling part (see layOutPage).
+	std::vector<PageItem> page;
+	RECT buttons[3] = {};    // the buttons under it, in the dialog at its design size
+	SIZE design     = {};    // the client size the template gives the dialog
+	int  pageEnd    = 0;     // at that size, where the scrolling part ends and the row of buttons begins
+	int  content    = 0;     // how high everything that scrolls is
+	int  scroll     = 0;     // how far it is scrolled
+	RECT view       = {};    // the part of the dialog it shows through, as last laid out
+	int  wheel      = 0;     // mouse wheel movement not yet turned into scrolling
+	bool rescaling  = false; // between WM_DPICHANGED and the layout that follows it
 };
 static OptionsState *optionsState(HWND d) {
 	return (OptionsState *)GetWindowLongPtrW(d, DWLP_USER);
@@ -1301,19 +1320,8 @@ static void layOutRows(HWND d, bool opening) {
 	moveInDialog(slider, rc);
 }
 
-// A tooltip tool that is a place in the dialog, not a control (see addHelpTexts), has to be
-// told when the control it stands for has moved. Nothing happens if the tooltip has no such tool.
-static void moveRectTool(HWND d, HWND tip, int ctrlId) {
-	TTTOOLINFOW ti = {sizeof(ti)};
-	ti.hwnd        = d;
-	ti.uId         = (UINT_PTR)ctrlId;
-	ti.rect        = rectInDialog(d, GetDlgItem(d, ctrlId));
-	if (tip)
-		SendMessageW(tip, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
-}
-
-// Longer explanations, each shown as a tooltip when hovering the control it belongs to. The
-// same controls get the help cursor (see WM_SETCURSOR).
+// Longer explanations, each shown as a tooltip when hovering the label it belongs to; for a
+// checkbox that is its text, not its box. The same places get the help cursor (see cursorAt).
 static const wchar_t kRotateHelp[] =
     L"Only a 90\u00B0 clockwise rotation works. A 90\u00B0 counterclockwise rotation and 180\u00B0 rotations don't work."
     L"\r\n\r\n"
@@ -1324,7 +1332,7 @@ static const wchar_t kSyncHelp[] =
     L"displays. The app also brings the other displays in line with the selected one when a display is detected "
     L"and when the displays come back on after sleep. Displays of different models are matched in nits, so that "
     L"they look equally bright.\r\n\r\n"
-    L"Automatic brightness and the color preset stay separate for each display.";
+    L"Automatic brightness and the preset stay separate for each display.";
 static const wchar_t kAmbientHelp[] =
     L"The reading is looked for in this order:\r\n\r\n"
     L"1. The display's own sensor.\r\n"
@@ -1342,7 +1350,7 @@ static const wchar_t kAutoHelp[] =
     L"It reacts only when the light changes by 20 % or more, and moves to the new level gradually.\r\n\r\n"
     L"The limits and times below set how far and how fast it may go.\r\n\r\n"
     L"It works for each display separately, from the sensor shown in \"Ambient light\", and does nothing "
-    L"while HDR is on, while a color preset fixes the brightness, or while no sensor is reporting.\r\n\r\n"
+    L"while HDR is on, while a preset fixes the brightness, or while no sensor is reporting.\r\n\r\n"
     L"The line below shows the reference (Set) and the current brightness (Now).";
 static const wchar_t kBrightenLimitHelp[] =
     L"How far automatic brightness may raise the brightness above the level you set, in percent of the "
@@ -1363,24 +1371,85 @@ static const wchar_t kStepsHelp[] =
 static const struct {
 	int            ctrlId;
 	const wchar_t *text;
-	// Whether the explanation is also there while the control is disabled. Not for the automatic
-	// brightness checkbox: it is disabled only by HDR or by a color preset, and then it has the
-	// tooltip that says which (see fillDisplayControls).
-	bool whenDisabled;
-} kHelpTexts[] = {{IDC_AUTO_ROTATE, kRotateHelp, true},
-                  {IDC_LINK_DISPLAYS, kSyncHelp, true},
-                  {IDC_AMBIENT_LABEL, kAmbientHelp, true},
-                  {IDC_AUTO_BRIGHTNESS, kAutoHelp, false},
-                  {IDC_BRIGHTEN_LIMIT_LABEL, kBrightenLimitHelp, true},
-                  {IDC_DIM_LIMIT_LABEL, kDimLimitHelp, true},
-                  {IDC_STEPS_LABEL, kStepsHelp, true}};
+} kHelpTexts[] = {{IDC_AUTO_ROTATE, kRotateHelp},
+                  {IDC_LINK_DISPLAYS, kSyncHelp},
+                  {IDC_AMBIENT_LABEL, kAmbientHelp},
+                  {IDC_AUTO_BRIGHTNESS, kAutoHelp},
+                  {IDC_BRIGHTEN_LIMIT_LABEL, kBrightenLimitHelp},
+                  {IDC_DIM_LIMIT_LABEL, kDimLimitHelp},
+                  {IDC_STEPS_LABEL, kStepsHelp}};
 
-// Whether hovering this control shows a help text right now.
-static bool showsHelpText(HWND d, int ctrlId) {
+static bool hasHelpText(int ctrlId) {
 	for (const auto &help : kHelpTexts)
 		if (help.ctrlId == ctrlId)
-			return help.whenDisabled || IsWindowEnabled(GetDlgItem(d, ctrlId));
+			return true;
 	return false;
+}
+
+// The controls that say why they are disabled, when there is a text for the reason (see
+// fillDisplayControls).
+static const int kWhyControls[] = {IDC_AUTO_BRIGHTNESS, IDC_BRIGHTNESS_SLIDER, IDC_SLIDER_PERCENT,
+                                   IDC_SLIDER_PERCENT_SPIN, IDC_PRESET_COMBO};
+
+/* ---------- the tooltip: explanations, and why a control is disabled ---------- */
+// One tooltip for the whole dialog. Its tools are places, and there are two kinds of them:
+//  - in a control, for the mouse the control has: a label that has an explanation, and of a
+//    checkbox that has one only its label, not its box;
+//  - in the dialog, for the mouse the dialog has, which is the mouse over a disabled control:
+//    the same explanation on the same label, and on what cannot be operated the reason, if
+//    there is a text for it. On a checkbox what cannot be operated is its box.
+// A place in the dialog is told by the id of its control, plus kWhyTool for a reason.
+constexpr UINT_PTR kLabelTool = 1;
+constexpr UINT_PTR kWhyTool   = 0x10000;
+
+static bool isCheckbox(HWND ctrl) {
+	return isClass(ctrl, WC_BUTTONW) && (GetWindowLongW(ctrl, GWL_STYLE) & BS_TYPEMASK) == BS_AUTOCHECKBOX;
+}
+
+// A checkbox is a box and, beside it, a label. Where the label begins, counted from the left
+// edge of the control: what the control needs in all, less what its text takes.
+static int checkboxLabelLeft(HWND box) {
+	RECT own;
+	GetClientRect(box, &own);
+	wchar_t text[128] = {};
+	int     length    = GetWindowTextW(box, text, 128);
+	SIZE    all = {}, label = {};
+	HDC     dc  = GetDC(box);
+	HGDIOBJ old = SelectObject(dc, (HFONT)SendMessageW(box, WM_GETFONT, 0, 0));
+	GetTextExtentPoint32W(dc, text, length, &label);
+	SelectObject(dc, old);
+	ReleaseDC(box, dc);
+	LONG left = SendMessageW(box, BCM_GETIDEALSIZE, 0, (LPARAM)&all) && all.cx > label.cx
+	                ? all.cx - label.cx
+	                : own.bottom + own.bottom / 4; // no answer: a box is about as wide as the control is high
+	return (int)std::min(left, own.right);
+}
+
+// A control's place in the dialog: all of it, or one of the two sides of a checkbox.
+enum class Part { All, Box, Label };
+static RECT partInDialog(HWND d, HWND ctrl, Part part) {
+	RECT rc = rectInDialog(d, ctrl);
+	if (part != Part::All) {
+		LONG split = std::min(rc.right, rc.left + checkboxLabelLeft(ctrl));
+		(part == Part::Box ? rc.right : rc.left) = split;
+	}
+	return rc;
+}
+
+static void addTool(HWND tip, HWND in, UINT_PTR id, const wchar_t *text) {
+	TTTOOLINFOW ti = {sizeof(ti)};
+	ti.uFlags      = TTF_SUBCLASS;
+	ti.hwnd        = in;
+	ti.uId         = id;
+	ti.lpszText    = (LPWSTR)text;
+	SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti); // placeTips says where
+}
+static void moveTool(HWND tip, HWND in, UINT_PTR id, const RECT &rc) {
+	TTTOOLINFOW ti = {sizeof(ti)};
+	ti.hwnd        = in;
+	ti.uId         = id;
+	ti.rect        = rc;
+	SendMessageW(tip, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
 }
 
 static HWND addHelpTexts(HWND d) {
@@ -1389,26 +1458,310 @@ static HWND addHelpTexts(HWND d) {
 		return nullptr;
 	SendMessageW(tip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 30000); // long enough to read
 	for (const auto &help : kHelpTexts) {
-		// Twice. On the control itself, for when the mouse is the control's. And on the place
-		// the control takes up in the dialog, for when the control is disabled and the mouse is
-		// the dialog's instead: the explanation matters no less then. The second one is left out
-		// for a control that has another tooltip while it is disabled.
-		HWND        ctrl = GetDlgItem(d, help.ctrlId);
-		TTTOOLINFOW ti   = {sizeof(ti)};
-		ti.uFlags        = TTF_IDISHWND | TTF_SUBCLASS;
-		ti.hwnd          = d;
-		ti.uId           = (UINT_PTR)ctrl;
-		ti.lpszText      = (LPWSTR)help.text;
-		SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
-		if (!help.whenDisabled)
-			continue;
-
-		ti.uFlags = TTF_SUBCLASS;
-		ti.uId    = (UINT_PTR)help.ctrlId;
-		ti.rect   = rectInDialog(d, ctrl);
-		SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+		addTool(tip, GetDlgItem(d, help.ctrlId), kLabelTool, help.text);
+		addTool(tip, d, (UINT_PTR)help.ctrlId, help.text);
 	}
+	// The reasons keep their places for good; a place with an empty text shows nothing.
+	for (int ctrlId : kWhyControls)
+		addTool(tip, d, kWhyTool + (UINT_PTR)ctrlId, L"");
 	return tip;
+}
+
+// Say on a control why it is disabled. With nullptr it says nothing.
+static void setWhy(HWND d, int ctrlId, const wchar_t *why) {
+	const OptionsState *os = optionsState(d);
+	if (!os || !os->tip)
+		return;
+	TTTOOLINFOW ti = {sizeof(ti)};
+	ti.hwnd        = d;
+	ti.uId         = kWhyTool + (UINT_PTR)ctrlId;
+	ti.lpszText    = (LPWSTR)(why ? why : L"");
+	SendMessageW(os->tip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+}
+
+// Put every place of the tooltip where its control is now. In the dialog that is no further
+// than the scrolling part shows: a control scrolled out of sight explains nothing.
+static void placeTips(HWND d) {
+	const OptionsState *os = optionsState(d);
+	if (!os || !os->tip)
+		return;
+	auto shown = [os](RECT rc) {
+		RECT part;
+		if (!IntersectRect(&part, &rc, &os->view))
+			SetRectEmpty(&part);
+		return part;
+	};
+	for (const auto &help : kHelpTexts) {
+		HWND ctrl  = GetDlgItem(d, help.ctrlId);
+		bool label = isCheckbox(ctrl); // only the label of a checkbox explains, not its box
+		RECT own;
+		GetClientRect(ctrl, &own);
+		if (label)
+			own.left = checkboxLabelLeft(ctrl);
+		moveTool(os->tip, ctrl, kLabelTool, own);
+		moveTool(os->tip, d, (UINT_PTR)help.ctrlId, shown(partInDialog(d, ctrl, label ? Part::Label : Part::All)));
+	}
+	for (int ctrlId : kWhyControls) {
+		HWND ctrl = GetDlgItem(d, ctrlId);
+		moveTool(os->tip, d, kWhyTool + (UINT_PTR)ctrlId, shown(partInDialog(d, ctrl, isCheckbox(ctrl) ? Part::Box : Part::All)));
+	}
+}
+
+// The cursor that says what hovering does at a place in the dialog, or nullptr for the usual one:
+//  - the help cursor over a label that has an explanation, disabled or not, and over the label
+//    of a checkbox that has one;
+//  - the "unavailable" cursor over a control that is disabled, and over the box of a disabled
+//    checkbox. A label that is greyed with its control is not something to be unavailable.
+static const wchar_t *cursorAt(HWND d, POINT at) {
+	const OptionsState *os = optionsState(d);
+	if (!os || !PtInRect(&os->view, at))
+		return nullptr; // not over the scrolling part
+	HWND ctrl = ChildWindowFromPointEx(d, at, CWP_SKIPINVISIBLE);
+	if (!ctrl || ctrl == d)
+		return nullptr;
+	bool help = hasHelpText(GetDlgCtrlID(ctrl));
+	if (isClass(ctrl, WC_STATICW))
+		return help ? IDC_HELP : nullptr;
+	if (help && isCheckbox(ctrl) && at.x >= partInDialog(d, ctrl, Part::Label).left)
+		return IDC_HELP;
+	return IsWindowEnabled(ctrl) ? nullptr : IDC_NO;
+}
+
+/* ---------- the scrolling part of the dialog ---------- */
+// The dialog can be made lower than what it has to show, and opens lower on a screen that is
+// not high enough for it. Everything except the row of buttons at the bottom then scrolls.
+// The controls stay direct children of the dialog, so that Windows goes on rescaling them for
+// a monitor with another scaling and nothing else here has to know. Scrolling moves them, and
+// none shows, or takes the mouse, outside the scrolling part (see layOutPage).
+// Made wider, the dialog gives the room to the controls that can use it.
+static const int kPageButtons[] = {IDC_RESET_SHORTCUTS, IDOK, IDCANCEL}; // the first keeps left, the others right
+// Following the right edge of the dialog: with its own right edge, so that it stretches...
+static const int kPageStretch[] = {IDC_DISPLAY_COMBO, IDC_PRESET_COMBO, IDC_PRESET_NOTE, IDC_BRIGHTNESS_SLIDER,
+                                   IDC_AMBIENT_VALUE, IDC_AUTO_STATUS,  IDC_HOTKEY_UP,   IDC_HOTKEY_DOWN};
+// ...or as a whole: what stands to the right of the slider.
+static const int kPageMove[] = {IDC_SLIDER_BRIGHT_LABEL, IDC_SLIDER_PERCENT, IDC_SLIDER_PERCENT_SPIN, IDC_SLIDER_PERCENT_UNIT};
+constexpr UINT_PTR kPageCtrlSubclass = 2;
+
+template <size_t N> static bool among(const int (&ids)[N], int id) {
+	return std::find(ids, ids + N, id) != ids + N;
+}
+static int dialogUnitsY(HWND d, int units) {
+	RECT rc = {0, 0, 0, units};
+	MapDialogRect(d, &rc);
+	return rc.bottom;
+}
+
+// Note where the layout has put everything. Called with the dialog as the template and
+// layOutRows leave it: not scrolled, and with its controls where they are at the design width.
+static void capturePage(HWND d) {
+	OptionsState *os = optionsState(d);
+	if (!os)
+		return;
+	RECT design = {0, 0, OPTIONS_DLG_W, OPTIONS_DLG_H};
+	MapDialogRect(d, &design);
+	os->design = {design.right, design.bottom};
+	os->scroll = 0;
+	os->page.clear();
+
+	LONG top = design.bottom;
+	for (int i = 0; i < 3; ++i) {
+		os->buttons[i] = rectInDialog(d, GetDlgItem(d, kPageButtons[i]));
+		top            = std::min(top, os->buttons[i].top);
+	}
+	int margin  = dialogUnitsY(d, 4);
+	os->pageEnd = (int)top - margin;
+
+	LONG bottom = 0;
+	for (HWND c = GetWindow(d, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+		int id = GetDlgCtrlID(c);
+		if (id == IDC_OPTIONS_SCROLL || id == IDC_OPTIONS_EDGE || among(kPageButtons, id))
+			continue;
+		PageItem item = {c, rectInDialog(d, c), 0, among(kPageStretch, id) ? 1 : among(kPageMove, id) ? 2 : 0, false};
+		if (isClass(c, WC_COMBOBOXW)) {
+			RECT open = {};
+			SendMessageW(c, CB_GETDROPPEDCONTROLRECT, 0, (LPARAM)&open);
+			item.open = open.bottom - open.top;
+		}
+		bottom = std::max(bottom, item.at.bottom);
+		os->page.push_back(item);
+	}
+	// Some room under the last row, but never so much that the dialog as designed would scroll.
+	os->content = std::max((int)bottom, std::min((int)bottom + margin, os->pageEnd));
+}
+
+// Put everything where the size of the dialog and the scrolling have it. `asDesigned` is for
+// the dialog as the template gives it, whatever size it has at the moment.
+static void layOutPage(HWND d, bool asDesigned = false) {
+	OptionsState *os = optionsState(d);
+	if (!os || os->page.empty())
+		return;
+	RECT client = {0, 0, os->design.cx, os->design.cy};
+	if (!asDesigned)
+		GetClientRect(d, &client);
+	int  strip = os->design.cy - os->pageEnd; // the row of buttons keeps its height
+	int  viewH = std::max(0, (int)client.bottom - strip);
+	bool bar   = os->content > viewH;
+	int  barW  = bar ? GetSystemMetricsForDpi(SM_CXVSCROLL, (UINT)DpiOfWindow(d)) : 0;
+	int  viewW = std::max(0, (int)client.right - barW);
+	int  wider = viewW - (int)os->design.cx; // under 0 only by the scroll bar, in a dialog not made wider
+	os->scroll = std::clamp(os->scroll, 0, std::max(0, os->content - viewH));
+	os->view   = {0, 0, viewW, viewH};
+
+	// A control shows, and takes the mouse, only where the scrolling part does. One that is partly
+	// out of it gets a window region for the part that is in it. One that is out of it altogether
+	// is put out of the dialog: it stays a control the keyboard can get to, which a hidden one
+	// would not be, and getting the keyboard brings it back into view.
+	const UINT flags  = SWP_NOZORDER | SWP_NOACTIVATE;
+	const int  parked = -30000;
+	HWND       bars   = GetDlgItem(d, IDC_OPTIONS_SCROLL), edge = GetDlgItem(d, IDC_OPTIONS_EDGE);
+	std::vector<HRGN> parts(os->page.size(), nullptr); // nullptr: all of the control
+	HDWP              batch = BeginDeferWindowPos((int)os->page.size() + 5);
+	for (size_t i = 0; i < os->page.size(); ++i) {
+		const PageItem &item = os->page[i];
+		RECT            rc   = item.at, part;
+		if (item.follow == 1)
+			rc.right = std::max(rc.left, rc.right + wider);
+		else if (item.follow == 2)
+			OffsetRect(&rc, wider, 0);
+		OffsetRect(&rc, 0, -os->scroll);
+		if (!IntersectRect(&part, &rc, &os->view)) {
+			OffsetRect(&rc, 0, parked - rc.top);
+		} else if (!EqualRect(&part, &rc)) {
+			OffsetRect(&part, -rc.left, -rc.top);
+			parts[i] = CreateRectRgnIndirect(&part);
+		}
+		if (batch)
+			batch = DeferWindowPos(batch, item.ctrl, nullptr, rc.left, rc.top, rc.right - rc.left,
+			                       item.open ? item.open : rc.bottom - rc.top, flags);
+	}
+	for (int i = 0; i < 3 && batch; ++i) {
+		RECT rc = os->buttons[i];
+		OffsetRect(&rc, i ? client.right - os->design.cx : 0, client.bottom - os->design.cy);
+		batch = DeferWindowPos(batch, GetDlgItem(d, kPageButtons[i]), nullptr, rc.left, rc.top, rc.right - rc.left,
+		                       rc.bottom - rc.top, flags);
+	}
+	if (batch)
+		batch = DeferWindowPos(batch, bars, nullptr, viewW, 0, barW, viewH, flags);
+	if (batch)
+		batch = DeferWindowPos(batch, edge, nullptr, 0, viewH, client.right, GetSystemMetrics(SM_CYEDGE), flags);
+	if (batch)
+		EndDeferWindowPos(batch);
+
+	for (size_t i = 0; i < os->page.size(); ++i) {
+		PageItem &item = os->page[i];
+		if (!parts[i] && !item.clipped)
+			continue;
+		SetWindowRgn(item.ctrl, parts[i], TRUE); // the region is the system's from here on
+		item.clipped = parts[i] != nullptr;
+	}
+
+	// The scroll bar, and a line over the buttons, only while there is something to scroll.
+	SCROLLINFO si = {sizeof(si), SIF_RANGE | SIF_PAGE | SIF_POS};
+	si.nMax       = std::max(0, os->content - 1);
+	si.nPage      = (UINT)viewH;
+	si.nPos       = os->scroll;
+	SetScrollInfo(bars, SB_CTL, &si, TRUE);
+	ShowWindow(bars, bar ? SW_SHOWNA : SW_HIDE);
+	ShowWindow(edge, bar ? SW_SHOWNA : SW_HIDE);
+
+	// What a control no longer covers is the dialog's to paint again, and that includes what a
+	// region has just cut off: paint all of it rather than work out which parts.
+	RedrawWindow(d, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+	placeTips(d);
+}
+
+static void scrollPageTo(HWND d, int to) {
+	OptionsState *os = optionsState(d);
+	if (!os)
+		return;
+	to = std::clamp(to, 0, std::max(0, os->content - (int)os->view.bottom));
+	if (to == os->scroll)
+		return;
+	os->scroll = to;
+	if (os->tip)
+		SendMessageW(os->tip, TTM_POP, 0, 0); // it is about a place that is moving away
+	layOutPage(d);
+}
+
+// The scroll bar: a WM_VSCROLL request.
+static void scrollPageBy(HWND d, WPARAM request) {
+	const OptionsState *os = optionsState(d);
+	if (!os)
+		return;
+	int line = dialogUnitsY(d, 10), page = std::max(line, (int)os->view.bottom - line), to = os->scroll;
+	switch (LOWORD(request)) {
+	case SB_LINEUP:   to -= line; break;
+	case SB_LINEDOWN: to += line; break;
+	case SB_PAGEUP:   to -= page; break;
+	case SB_PAGEDOWN: to += page; break;
+	case SB_TOP:      to = 0; break;
+	case SB_BOTTOM:   to = os->content; break;
+	case SB_THUMBTRACK:
+	case SB_THUMBPOSITION: {
+		SCROLLINFO si = {sizeof(si), SIF_TRACKPOS};
+		GetScrollInfo(GetDlgItem(d, IDC_OPTIONS_SCROLL), SB_CTL, &si);
+		to = si.nTrackPos;
+		break;
+	}
+	default:
+		return;
+	}
+	scrollPageTo(d, to);
+}
+
+// Scroll so that a control is in view, with a little room around it.
+static void showInPage(HWND d, HWND ctrl) {
+	const OptionsState *os = optionsState(d);
+	if (!os)
+		return;
+	for (const PageItem &item : os->page) {
+		if (item.ctrl != ctrl)
+			continue;
+		int margin = dialogUnitsY(d, 6);
+		if (item.at.top - margin < os->scroll)
+			scrollPageTo(d, item.at.top - margin);
+		else if (item.at.bottom + margin > os->scroll + os->view.bottom)
+			scrollPageTo(d, item.at.bottom + margin - os->view.bottom);
+		return;
+	}
+}
+
+// On a screen that is not high enough for the whole dialog, open as high as the screen allows.
+static void fitDialogToScreen(HWND d) {
+	RECT        window;
+	MONITORINFO mi = {sizeof(mi)};
+	if (!GetWindowRect(d, &window) || !GetMonitorInfoW(MonitorFromWindow(d, MONITOR_DEFAULTTONEAREST), &mi))
+		return;
+	const RECT &work = mi.rcWork;
+	int width  = window.right - window.left;
+	int height = std::min((int)(window.bottom - window.top), (int)(work.bottom - work.top));
+	int x      = std::max((int)work.left, std::min((int)window.left, (int)work.right - width));
+	int y      = std::max((int)work.top, std::min((int)window.top, (int)work.bottom - height));
+	SetWindowPos(d, nullptr, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// Every control of the scrolling part is watched for two things.
+static LRESULT CALLBACK PageCtrlProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR id, DWORD_PTR) {
+	HWND d = GetParent(h);
+	switch (m) {
+	case WM_MOUSEWHEEL: {
+		// While the dialog scrolls, the wheel scrolls it wherever the mouse or the keyboard is.
+		// A list or a slider that changed under a wheel meant for the dialog would be a nasty
+		// surprise: both act at once here. An open list is another window and keeps its wheel.
+		const OptionsState *os   = optionsState(d);
+		bool                open = isClass(h, WC_COMBOBOXW) && SendMessageW(h, CB_GETDROPPEDSTATE, 0, 0);
+		if (os && os->content > os->view.bottom && !open)
+			return SendMessageW(d, WM_MOUSEWHEEL, w, l);
+		break;
+	}
+	case WM_SETFOCUS:
+		PostMessageW(d, WMAPP_OPTIONS_SHOW, (WPARAM)h, 0); // the keyboard has got here: have it in view
+		break;
+	case WM_NCDESTROY:
+		RemoveWindowSubclass(h, PageCtrlProc, id);
+		break;
+	}
+	return DefSubclassProc(h, m, w, l);
 }
 
 /* ---------- preset descriptions as tooltips on the dropdown items ---------- */
@@ -1559,7 +1912,7 @@ static void setPresetTips(HWND d, HWND combo, std::vector<std::wstring> descs) {
 
 /* ---------- the display selector and what follows from the display ---------- */
 // Fill the display list, the preset list and the notes that go with them.
-static void fillDisplayControls(HWND d, const DisplaysView &v, OptionsState &os) {
+static void fillDisplayControls(HWND d, const DisplaysView &v) {
 	bool have = v.active >= 0;
 
 	// The displays, in the order of the tray menu. Whether there is one to pick is up to
@@ -1572,10 +1925,10 @@ static void fillDisplayControls(HWND d, const DisplaysView &v, OptionsState &os)
 		SendMessageW(displays, CB_ADDSTRING, 0, (LPARAM)L"(no display detected)");
 	SendMessageW(displays, CB_SETCURSEL, have ? v.active : 0, 0);
 
-	// Color presets of the active display. Under HDR only the main "Apple XDR Display" presets
+	// Presets of the active display. Under HDR only the main "Apple XDR Display" presets
 	// stay listed (the only ones compatible with HDR): switching between those is valid,
 	// anything else can blank the panel.
-	std::vector<ColorPreset> shown;
+	std::vector<Preset> shown;
 	for (const auto &p : v.presets)
 		if (!v.hdr || p.isHdrCompatible())
 			shown.push_back(p);
@@ -1613,33 +1966,15 @@ static void fillDisplayControls(HWND d, const DisplaysView &v, OptionsState &os)
 	ShowWindow(hdrOff, v.hdr ? SW_SHOW : SW_HIDE);
 	EnableWindow(hdrOff, TRUE); // a click leaves it disabled until HDR is off
 
-	// Why the brightness controls are disabled, as a tooltip on them. Rect-based (TTF_SUBCLASS
-	// on the dialog) so that it works on disabled controls; an enabled control eats the mouse,
-	// so only disabled ones get it.
-	if (os.lockTip) {
-		DestroyWindow(os.lockTip);
-		os.lockTip = nullptr;
-	}
+	// Why a control is disabled, as a tooltip on it, where there is a text for the reason. HDR
+	// and a preset that fixes the brightness lock the brightness controls; HDR that leaves no
+	// preset to offer locks the preset list.
 	const wchar_t *why = v.hdr    ? L"Brightness is controlled by Windows while HDR is on"
-	                   : v.locked ? L"Brightness is fixed by the current color preset"
+	                   : v.locked ? L"Brightness is fixed by the current preset"
 	                              : nullptr;
-	if (why)
-		os.lockTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASS, nullptr, WS_POPUP | TTS_ALWAYSTIP,
-		                             0, 0, 0, 0, d, nullptr, g_hInst, nullptr);
-	if (os.lockTip) {
-		std::vector<int> targets{IDC_AUTO_BRIGHTNESS, IDC_BRIGHTNESS_SLIDER};
-		if (!IsWindowEnabled(combo))
-			targets.push_back(IDC_PRESET_COMBO);
-		for (int ctrlId : targets) {
-			TTTOOLINFOW ti = {sizeof(ti)};
-			ti.uFlags      = TTF_SUBCLASS;
-			ti.hwnd        = d;
-			ti.uId         = (UINT_PTR)ctrlId;
-			ti.rect        = rectInDialog(d, GetDlgItem(d, ctrlId));
-			ti.lpszText    = (LPWSTR)why;
-			SendMessageW(os.lockTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
-		}
-	}
+	for (int ctrlId : {IDC_AUTO_BRIGHTNESS, IDC_BRIGHTNESS_SLIDER, IDC_SLIDER_PERCENT, IDC_SLIDER_PERCENT_SPIN})
+		setWhy(d, ctrlId, why);
+	setWhy(d, IDC_PRESET_COMBO, v.hdr && have && shown.empty() ? L"Unavailable while HDR is on" : nullptr);
 }
 
 // The display list and "Sync manual brightness across displays". With one display, or none,
@@ -1668,7 +2003,7 @@ static void syncOptions(HWND d, bool wait, bool opening) {
 	// picked but not saved yet.
 	bool fill = !os->filled || !os->shown.sameAs(v);
 	if (fill) {
-		fillDisplayControls(d, v, *os);
+		fillDisplayControls(d, v);
 		os->shown  = std::move(v);
 		os->filled = true;
 	}
@@ -1688,9 +2023,13 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 		EnableWindow(GetDlgItem(d, IDC_HOTKEY_DOWN), g_settings.enableCustomHotkeys);
 		setDlgHotkey(d, IDC_HOTKEY_UP, g_settings.hkUp);
 		setDlgHotkey(d, IDC_HOTKEY_DOWN, g_settings.hkDown);
-		layOutRows(d, true); // before the tooltips, which go by where the controls are
-		if (OptionsState *os = optionsState(d))
-			os->helpTip = addHelpTexts(d);
+		layOutRows(d, true);
+		capturePage(d); // before the tooltips, which go by where the controls are
+		if (OptionsState *os = optionsState(d)) {
+			os->tip = addHelpTexts(d);
+			for (const PageItem &item : os->page)
+				SetWindowSubclass(item.ctrl, PageCtrlProc, kPageCtrlSubclass, 0);
+		}
 		initNumberFields(d);
 
 		// The brightness slider: the control Boot Camp Control Panel uses, 0 to 100, with Dim and
@@ -1702,25 +2041,31 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 		SendDlgItemMessageW(d, IDC_SLIDER_PERCENT, EM_SETLIMITTEXT, 3, 0);
 		SendDlgItemMessageW(d, IDC_SLIDER_PERCENT_SPIN, UDM_SETRANGE32, 0, 100);
 
-		// The displays, the color presets of the active one, and where its brightness is.
+		// The displays, the presets of the active one, and where its brightness is.
 		syncOptions(d, true, true);
+		fitDialogToScreen(d);
+		layOutPage(d);
 		SetTimer(d, ID_OPTIONS_TIMER, 200, nullptr);
 		return TRUE;
 	}
 	case WM_DPICHANGED:
 		// Moved to a monitor with another scaling. Windows rescales the dialog and everything in
-		// it once this message has gone unanswered; the rows are seen to after that.
+		// it once this message has gone unanswered, from where each control is at that moment:
+		// so put them where the layout has them first, unscrolled. The rows and the scrolling
+		// part are seen to after that.
+		if (OptionsState *os = optionsState(d)) {
+			os->rescaling = true;
+			os->scroll    = 0;
+			layOutPage(d, true);
+		}
 		PostMessageW(d, WMAPP_OPTIONS_ROWS, 0, 0);
 		break;
 	case WMAPP_OPTIONS_ROWS:
 		layOutRows(d, false);
-		if (const OptionsState *os = optionsState(d)) {
-			for (const auto &help : kHelpTexts)
-				if (help.whenDisabled)
-					moveRectTool(d, os->helpTip, help.ctrlId);
-			for (int ctrlId : {IDC_AUTO_BRIGHTNESS, IDC_BRIGHTNESS_SLIDER, IDC_PRESET_COMBO})
-				moveRectTool(d, os->lockTip, ctrlId);
-		}
+		if (OptionsState *os = optionsState(d))
+			os->rescaling = false;
+		capturePage(d);
+		layOutPage(d);
 		return TRUE;
 	case WM_NOTIFY: {
 		const NMHDR *nm = (const NMHDR *)lp;
@@ -1737,6 +2082,10 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 		return TRUE;
 	}
 	case WM_VSCROLL:
+		if ((HWND)lp == GetDlgItem(d, IDC_OPTIONS_SCROLL)) {
+			scrollPageBy(d, wp);
+			return TRUE;
+		}
 		// The arrows of the percent field: no need to wait for a pause as with typing.
 		if ((HWND)lp != GetDlgItem(d, IDC_SLIDER_PERCENT_SPIN))
 			break;
@@ -1753,17 +2102,55 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 		return TRUE;
 	}
 	case WM_SETCURSOR: {
-		// A control that shows a help tooltip says so with the help cursor. It is found by where
+		// The cursor says what hovering here does (see cursorAt). The place is found by where
 		// the mouse is and not by who has the mouse: over a disabled control that is the dialog.
 		POINT at;
 		GetCursorPos(&at);
 		ScreenToClient(d, &at);
-		if (LOWORD(lp) != HTCLIENT || !showsHelpText(d, GetDlgCtrlID(ChildWindowFromPointEx(d, at, CWP_SKIPINVISIBLE))))
+		const wchar_t *cursor = LOWORD(lp) == HTCLIENT ? cursorAt(d, at) : nullptr;
+		if (!cursor)
 			break;
-		SetCursor(LoadCursorW(nullptr, IDC_HELP));
+		SetCursor(LoadCursorW(nullptr, cursor));
 		SetWindowLongPtrW(d, DWLP_MSGRESULT, TRUE);
 		return TRUE;
 	}
+	case WM_SIZE:
+		if (const OptionsState *os = optionsState(d); os && !os->rescaling)
+			layOutPage(d);
+		break;
+	case WM_GETMINMAXINFO: {
+		// No narrower than designed, no lower than a few rows over the buttons, and no higher
+		// than everything there is to show.
+		const OptionsState *os = optionsState(d);
+		if (!os || os->page.empty())
+			break;
+		RECT window, client;
+		GetWindowRect(d, &window);
+		GetClientRect(d, &client);
+		int   frameW = (window.right - window.left) - client.right;
+		int   frameH = (window.bottom - window.top) - client.bottom;
+		int   strip  = os->design.cy - os->pageEnd;
+		auto *sizes  = (MINMAXINFO *)lp;
+		sizes->ptMinTrackSize   = {os->design.cx + frameW, std::min(os->content, dialogUnitsY(d, 120)) + strip + frameH};
+		sizes->ptMaxTrackSize.y = std::max(os->content, os->pageEnd) + strip + frameH;
+		return TRUE;
+	}
+	case WM_MOUSEWHEEL: {
+		OptionsState *os = optionsState(d);
+		if (!os || os->content <= os->view.bottom)
+			break; // nothing to scroll
+		UINT lines = 3;
+		SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+		int notch = lines == WHEEL_PAGESCROLL ? (int)os->view.bottom : (int)lines * dialogUnitsY(d, 10);
+		os->wheel += GET_WHEEL_DELTA_WPARAM(wp) * notch; // a touchpad sends a notch in small parts
+		int by    = os->wheel / WHEEL_DELTA;
+		os->wheel -= by * WHEEL_DELTA;
+		scrollPageTo(d, os->scroll - by);
+		return TRUE;
+	}
+	case WMAPP_OPTIONS_SHOW:
+		showInPage(d, (HWND)wp);
+		return TRUE;
 	case WM_DESTROY:
 		KillTimer(d, ID_OPTIONS_TIMER);
 		KillTimer(d, ID_TYPING_TIMER);
@@ -1885,7 +2272,7 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 			g_settings.SetStartup(g_settings.runAtStartup);
 			orient_set_enabled(g_settings.autoRotateEnabled.load());
 
-			// Apply the chosen color preset to the active display, then prompt to keep or auto-revert.
+			// Apply the chosen preset to the active display, then prompt to keep or auto-revert.
 			// Not persisted: a preset resets to the default at startup, changed only by hand here.
 			{
 				HWND combo = GetDlgItem(d, IDC_PRESET_COMBO);
@@ -1910,11 +2297,11 @@ INT_PTR CALLBACK OptionsDlgProc(HWND d, UINT msg, WPARAM wp, LPARAM lp) {
 								// Log the intent BEFORE the write (the file log flushes per line):
 								// if this switch takes the GPU driver down, the log still shows
 								// exactly what ran.
-								const ColorPreset *from  = dev.activePreset();
+								const Preset *from  = dev.activePreset();
 								const wchar_t     *toName = L"?";
 								for (const auto &p : dev.presets)
 									if ((int)p.index == hwIdx) { toName = p.name.c_str(); break; }
-								Log::Info(L"Switching color preset on %s: %d (%s) -> %d (%s), HDR=%d",
+								Log::Info(L"Switching preset on %s: %d (%s) -> %d (%s), HDR=%d",
 								          dev.name.c_str(), prevIdx, from ? from->name.c_str() : L"?",
 								          hwIdx, toName, g_hdrActive.load() ? 1 : 0);
 								if (dev.setActivePreset(hwIdx) == 0) {
@@ -2083,7 +2470,7 @@ LRESULT CALLBACK HiddenWndProc(HWND h, UINT m, WPARAM wParam, LPARAM lParam) {
 			}
 			if (!st.hasDisplay) return 0;
 			if (st.locked) { // reference-mode preset: brightness is fixed (macOS locks it there too)
-				TrayPopup::Show(h, 0, nullptr, true, L"Brightness fixed by the color preset");
+				TrayPopup::Show(h, 0, nullptr, true, L"Brightness fixed by the preset");
 				return 0;
 			}
 
@@ -2334,7 +2721,7 @@ void startWorker() {
 						          newDev.name.c_str(), newDev.minBrightness, newDev.maxBrightness,
 						          newDev.currentBrightness);
 
-						// Color presets: enumerate ONCE per physical display (cached), reset to the default ONCE per run.
+						// Presets: enumerate ONCE per physical display (cached), reset to the default ONCE per run.
 						// Re-enumerating or re-restoring on every reconnect loops, because switching a
 						// calibrated preset re-enumerates the display's HID descriptor (a disconnect).
 						if (newDev.hPreset != INVALID_HANDLE_VALUE) {
@@ -2355,7 +2742,7 @@ void startWorker() {
 								// some XDR units on every launch. Log first (the file log flushes per
 								// line) so a write that blanks the panel still shows in the log.
 								if (!newDev.presets.empty() && newDev.activePresetIndex != 0) {
-									Log::Info(L"Startup: resetting %s to its default color preset (was %d)",
+									Log::Info(L"Startup: resetting %s to its default preset (was %d)",
 									          newDev.name.c_str(), newDev.activePresetIndex);
 									if (newDev.setActivePreset(0) != 0)
 										Log::Warn(L"Default preset reset failed on %s", newDev.name.c_str());
@@ -2382,7 +2769,7 @@ void startWorker() {
 				std::lock_guard<std::mutex> lock(g_displayMutex);
 				for (auto &dev : g_displays) {
 					if (dev.maxBrightness <= dev.minBrightness)
-						continue; // brightness locked (e.g. a calibrated color preset); nothing to adjust
+						continue; // brightness locked (e.g. a calibrated preset); nothing to adjust
 					if (dev.activePresetLocksBrightness())
 						continue; // reference mode active: brightness is fixed (macOS parity)
 					float lux = getAmbientLux(dev); // per-device, ContainerId-matched sensor
